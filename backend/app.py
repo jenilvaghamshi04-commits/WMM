@@ -43,6 +43,8 @@ db.execute("create table if not exists auto_yes_jobs(id text primary key,princip
 for table,column,declaration in [('auto_yes_enrollments','no_reply',"TEXT NOT NULL DEFAULT ''"),('auto_yes_jobs','branch',"TEXT NOT NULL DEFAULT 'yes'")]:
     if column not in [r[1] for r in db.execute('pragma table_info('+table+')')]:db.execute('alter table '+table+' add column '+column+' '+declaration)
 db.execute("update auto_yes_jobs set status='Pending' where status='Sending'")
+# Completed conversations cannot be re-armed after upgrading or restarting.
+db.execute("update auto_yes_enrollments set enabled=0 where exists(select 1 from auto_yes_jobs j where j.principal=auto_yes_enrollments.principal and j.target=auto_yes_enrollments.target and j.status='Complete')")
 db.execute("create table if not exists auto_followup_jobs(root_id text primary key,principal text,target text unique,slot integer,contact_id text,due_at text,token_symbol text,exchange text,body text not null default '',status text not null default 'Scheduled',error text not null default '',next_attempt_at text not null default '')")
 db.execute("update auto_followup_jobs set status='Pending' where status='Sending'")
 db.execute('create index if not exists reply_target on replies(target,at)')
@@ -492,7 +494,7 @@ def auto_yes_summary(target,principals):
     job=db.execute('select id,status,step,error,branch from auto_yes_jobs where principal=? and target=?',(principal,target)).fetchone()
     status=job[1] if job else 'Waiting for yes / no'
     if status not in ('Complete','Cancelled','Needs attention') and (not enabled or not settings()['auto_yes_enabled']):status='Paused'
-    return {'exchange':exchange,'exchange_name':EXCHANGES.get(exchange,exchange),'token_symbol':token,'enabled':bool(enabled),'status':status,'sent_parts':job[2] if job else 0,'error':job[3] if job else '','job_id':job[0] if job else None,'branch':job[4] if job else None,'total_parts':(1 if job[4]=='no' else 2) if job else 0}
+    return {'exchange':exchange,'exchange_name':EXCHANGES.get(exchange,exchange),'token_symbol':token,'enabled':bool(enabled),'status':status,'sent_parts':job[2] if job else 0,'error':job[3] if job else '','job_id':job[0] if job else None,'branch':job[4] if job else None,'completed_once':bool(job and job[1]=='Complete'),'total_parts':(1 if job[4]=='no' else 2) if job else 0}
 def validate_auto_yes_send(job_id,principal,target):
     row=db.execute('select j.status,e.enabled from auto_yes_jobs j join auto_yes_enrollments e on e.principal=j.principal and e.target=j.target where j.id=? and j.principal=? and j.target=?',(job_id,principal,target)).fetchone()
     if not row or row[0] in ('Cancelled','Complete','Needs attention'):raise HTTPException(409,'This automatic sequence is no longer pending')
@@ -506,6 +508,7 @@ async def update_auto_yes(body:AutoYesControl):
     async with lock:
         target=body.key.split(':',1)[1]
         if not db.execute('select 1 from auto_yes_enrollments where target=?',(target,)).fetchone():raise HTTPException(404,'This contact has no automatic reply sequence')
+        if body.enabled and db.execute("select 1 from auto_yes_jobs where target=? and status in ('Complete','Cancelled','Needs attention')",(target,)).fetchone():raise HTTPException(409,'This automatic response has finished or stopped and cannot be restarted. Each conversation receives it once.')
         db.execute('update auto_yes_enrollments set enabled=? where target=?',(int(body.enabled),target))
         db.execute("update auto_yes_jobs set status=? where target=? and status in ('Pending','Paused')",('Pending' if body.enabled else 'Paused',target));db.commit()
     return {'ok':True}
@@ -522,7 +525,9 @@ async def process_auto_yes(limit=1):
                     current_part=part
                     db.execute("update auto_yes_jobs set status='Sending' where id=? and status in ('Pending','Paused')",(job_id,));db.commit()
                     await deliver(cid,slot,'dm',pitch if part==1 else demo,followup_of=root_id,request_id='auto-yes:'+job_id+':'+str(part),expected_principal=principal,token_symbol=token,exchange=exchange,automation_job=job_id,automation_step=part)
-                    db.execute("update auto_yes_jobs set step=?,status=?,error='',next_attempt_at='' where id=?",(part,'Complete' if part==total_parts else 'Pending',job_id));db.commit()
+                    with db:
+                        db.execute("update auto_yes_jobs set step=?,status=?,error='',next_attempt_at='' where id=?",(part,'Complete' if part==total_parts else 'Pending',job_id))
+                        if part==total_parts:db.execute('update auto_yes_enrollments set enabled=0 where principal=? and target=?',(principal,target))
                 results.append({'job_id':job_id,'status':'Complete'})
             except Exception as exc:
                 existing=db.execute('select status from auto_yes_jobs where id=?',(job_id,)).fetchone()[0]

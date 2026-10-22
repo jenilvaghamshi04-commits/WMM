@@ -62,7 +62,7 @@ class AutomaticReplyTests(unittest.TestCase):
     def test_missing_original_sender_waits(self):
         self.arm();self.reply();self.app.clients[1]=self.sender(user=202);self.process();self.assertEqual(len(self.client.sent),1);self.assertEqual(self.app.auto_yes_summary('999',{'101'})['status'],'Pending')
     def test_crash_after_confirmed_part_reuses_outbox(self):
-        self.arm();self.reply();self.process();self.app.db.execute("update auto_yes_jobs set step=0,status='Pending'");self.app.db.commit();self.process();self.assertEqual(len(self.client.sent),3);self.assertEqual(self.app.auto_yes_summary('999',{'101'})['status'],'Complete')
+        self.arm();self.reply();self.process();self.app.db.execute("update auto_yes_jobs set step=0,status='Pending'");self.app.db.execute("update auto_yes_enrollments set enabled=1");self.app.db.commit();self.process();self.assertEqual(len(self.client.sent),3);self.assertEqual(self.app.auto_yes_summary('999',{'101'})['status'],'Complete')
     def test_restart_keeps_pending_job_and_no_replay(self):
         self.arm();self.reply('no');self.app.db.close();self.load();self.app.clients[1]=self.client;self.process();self.reply('no');self.process();self.assertEqual(len(self.client.sent),2)
     def test_exchange_and_token_required_before_initial(self):
@@ -78,3 +78,13 @@ class AutomaticReplyTests(unittest.TestCase):
         self.assertEqual(len(self.app.EXCHANGES),14)
         for key,name in self.app.EXCHANGES.items():self.assertEqual(self.app.normalize_exchange(name),key)
         self.assertEqual(self.app.personalize_message('Hi @username @TOKEN {{exchange}}',{'username':'alice'},'ABC','lbank'),'Hi @alice $ABC LBank')
+    def test_completed_response_disables_enrollment_and_cannot_resume(self):
+        self.arm();self.reply();self.process();summary=self.app.auto_yes_summary('999',{'101'});self.assertFalse(summary['enabled']);self.assertTrue(summary['completed_once'])
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.update_auto_yes(self.app.AutoYesControl(key='dm:999',enabled=True)))
+        self.assertEqual(e.exception.status_code,409);self.reply('yes',501);self.reply('no',502);self.process();self.assertEqual(len(self.client.sent),3)
+    def test_completed_sequence_stays_stopped_after_restart_and_template_edit(self):
+        self.arm();self.reply();self.process();self.app.db.close();self.load();self.app.clients[1]=self.client
+        self.run_async(self.app.save_templates(self.app.Templates(template='New initial',followup_template='New follow',yes_pitch_template='Different pitch',yes_demo_template='Different invitation')))
+        self.reply('yeh',501);self.process();self.assertEqual(len(self.client.sent),3);self.assertFalse(self.app.auto_yes_summary('999',{'101'})['enabled'])
+    def test_upgrade_disables_previously_completed_enrollment_without_resending(self):
+        self.arm();self.reply();self.process();self.app.db.execute('update auto_yes_enrollments set enabled=1');self.app.db.commit();self.app.db.close();self.load();self.app.clients[1]=self.client;self.process();self.assertFalse(self.app.auto_yes_summary('999',{'101'})['enabled']);self.assertEqual(len(self.client.sent),3)

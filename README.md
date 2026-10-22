@@ -155,3 +155,6 @@ SQLite persists each scheduled job and fixed request ID. A confirmed send surviv
 
 
 Positive reply folder routing: a clear yes (including yeah/yeh) moves the conversation to 🟡 on its original Telegram account and keeps it there after the automatic pitch, call invitation, or later outgoing messages. The shared routing queue enforces this rule. Startup and folder-sync seeding also repair existing positive conversations that an older version moved back to 🔵. Repeated repair checks do not requeue an already-yellow route, and folder updates never resend messages. Other reply routing behavior remains in place.
+
+
+One-time automatic response: a clear yes sends exactly one pitch and one separate call invitation, then permanently disables that conversation’s automatic reply enrollment. Both messages use the original sender and the chat stays in 🟡. Later yes/no replies, template edits, rescans, restarts, or pause/resume requests cannot restart a completed response. The control endpoint rejects resuming terminal sequences; partial failed/uncertain deliveries retain their review requirement. Existing completed sequences are disabled during upgrade without sending anything. The three-day no-reply follow-up stays stopped after any detected reply. Lead cards show “Sent once · automation stopped” after completion.
