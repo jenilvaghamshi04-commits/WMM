@@ -1,4 +1,4 @@
-import os,json,sqlite3,asyncio,secrets,re,hashlib,uuid
+import os,json,sqlite3,asyncio,secrets,re,hashlib,uuid,copy
 from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -7,14 +7,15 @@ from fastapi import FastAPI,Depends,Header,HTTPException,Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel,SecretStr,Field
 from telethon import TelegramClient,functions,types,errors,utils,events
+from telethon.extensions import BinaryReader
 
 ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True);os.chmod(ROOT,0o700)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.2')
+app=FastAPI(title='WMM Team',version='3.3')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
-lock=asyncio.Lock();phone_hash={};clients={};startup_errors={};reply_task=None
+lock=asyncio.Lock();phone_hash={};clients={};startup_errors={};reply_task=None;folder_task=None
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
 db.execute('create table if not exists contacts(id text primary key, data text)')
 db.execute('create table if not exists settings(id integer primary key, data text)')
@@ -29,6 +30,10 @@ db.execute('create table if not exists message_details(delivery_id text primary 
 if 'token_symbol' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column token_symbol text not null default ''")
 db.execute('create table if not exists followup_requests(request_id text primary key, delivery_id text, parent_id text, message_hash text)')
 db.execute('create table if not exists meta(key text primary key, value text)')
+if 'telegram_message_id' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column telegram_message_id integer not null default 0")
+db.execute("create table if not exists folder_routes(principal text, target text, slot integer, desired text, applied text not null default '', revision integer not null default 1, applied_revision integer not null default 0, queued_at text, checked_at text not null default '', error text not null default '', next_attempt_at text not null default '', primary key(principal,target))")
+db.execute('create table if not exists folder_pauses(principal text primary key, until_at text, error text)')
+db.execute('create table if not exists empty_folder_templates(principal text, title text, folder_id integer, body blob, primary key(principal,title))')
 db.execute("create table if not exists lead_settings(key text primary key, stage text, reminder_days integer not null default 3, reminders_enabled integer not null default 1, acknowledged_at text not null default '', updated_at text not null default '')")
 db.execute('create table if not exists replies(principal text, target text, message_id integer, slot integer, at text, body text, primary key(principal,target,message_id))')
 db.execute('create index if not exists reply_target on replies(target,at)')
@@ -198,7 +203,11 @@ def record_reply(principal,target,slot,message):
     if at<datetime.fromisoformat(first).replace(microsecond=0):return False
     text=(getattr(message,'raw_text',None) or getattr(message,'message',None) or '[Media message]')[:4096]
     cursor=db.execute('insert or ignore into replies values(?,?,?,?,?,?)',(str(principal),str(target),message.id,slot,at.astimezone(timezone.utc).isoformat(),text));db.commit()
-    if cursor.rowcount:advance_lead('dm:'+str(target),'Replied')
+    if cursor.rowcount:
+        advance_lead('dm:'+str(target),'Replied')
+        last=db.execute("select o.at,coalesce(d.telegram_message_id,0) from outbox o left join message_details d on d.delivery_id=o.id where o.principal=? and o.target=? and o.kind='dm' and o.status='Sent' order by o.at desc limit 1",(str(principal),str(target))).fetchone()
+        if last and (message.id>last[1] if last[1] else at>=datetime.fromisoformat(last[0]).replace(microsecond=0)):
+            queue_folder_route(str(principal),str(target),slot,'🟡',force=True)
     return bool(cursor.rowcount)
 def attach_reply_listener(client,slot):
     if not hasattr(client,'add_event_handler'):return client
@@ -236,7 +245,7 @@ def lead_records():
         sync_error=next((r[3] for r in sync_rows if r[3]),'')
         fully_checked=bool(principals and len(sync_rows)==len(principals) and all(r[2] and not r[3] for r in sync_rows))
         last_activity=max([contact.get('scanned_at') or '',cfg['updated_at'] or '',latest_reply['at'] if replied else '',rows[0]['at'] if rows else ''])
-        result.append({'key':key,'contact_id':contact['id'],'name':contact.get('name',target),'username':contact.get('username',''),'group':contact.get('group',''),'kind':kind,'target':target,'stage':stage,'reply_status':'Replied' if replied else 'Awaiting reply' if sent and kind=='dm' else 'Not tracked' if kind=='group' else 'Not contacted','latest_reply':latest_reply,'replies':replies,'needs_attention':bool(replied and latest_reply['at']>cfg['acknowledged_at'] and stage!='Client'),'reminder_days':cfg['reminder_days'],'reminders_enabled':bool(cfg['reminders_enabled']),'reminder_active':reminder_active,'due_at':due_at if reminder_active else None,'followup_due':bool(reminder_active and datetime.fromisoformat(due_at)<=now),'reminder_reason':'Stopped — reply received' if replied else 'Complete' if stage=='Client' else 'Paused' if not cfg['reminders_enabled'] else 'Review uncertain delivery' if pending else 'Direct messages only' if kind=='group' else 'Waiting for first send' if not last_sent else 'Scheduled','last_sent_at':last_sent['at'] if last_sent else None,'followup_delivery_id':last_sent['delivery_id'] if last_sent else None,'last_activity_at':last_activity,'sync_checked_at':max([r[1] or '' for r in sync_rows],default=''),'sync_complete':fully_checked,'sync_error':sync_error})
+        result.append({'key':key,'contact_id':contact['id'],'name':contact.get('name',target),'username':contact.get('username',''),'group':contact.get('group',''),'kind':kind,'target':target,'stage':stage,'reply_status':'Replied' if replied else 'Awaiting reply' if sent and kind=='dm' else 'Not tracked' if kind=='group' else 'Not contacted','latest_reply':latest_reply,'replies':replies,'needs_attention':bool(replied and latest_reply['at']>cfg['acknowledged_at'] and stage!='Client'),'reminder_days':cfg['reminder_days'],'reminders_enabled':bool(cfg['reminders_enabled']),'reminder_active':reminder_active,'due_at':due_at if reminder_active else None,'followup_due':bool(reminder_active and datetime.fromisoformat(due_at)<=now),'reminder_reason':'Stopped — reply received' if replied else 'Complete' if stage=='Client' else 'Paused' if not cfg['reminders_enabled'] else 'Review uncertain delivery' if pending else 'Direct messages only' if kind=='group' else 'Waiting for first send' if not last_sent else 'Scheduled','last_sent_at':last_sent['at'] if last_sent else None,'followup_delivery_id':last_sent['delivery_id'] if last_sent else None,'last_activity_at':last_activity,'sync_checked_at':max([r[1] or '' for r in sync_rows],default=''),'sync_complete':fully_checked,'sync_error':sync_error,'folder_routes':folder_route_records(target,principals) if kind=='dm' else []})
     return sorted(result,key=lambda r:r['last_activity_at'],reverse=True)
 
 class LeadUpdate(BaseModel):
@@ -313,21 +322,135 @@ async def reply_sync_loop():
         except asyncio.CancelledError:raise
         except Exception:pass  # One unavailable session must not stop checking other senders.
 
+# Telegram emoji folders are separate from delivery status and lead stages.
+def queue_folder_route(principal,target,slot,desired,force=False):
+    row=db.execute('select desired from folder_routes where principal=? and target=?',(str(principal),str(target))).fetchone()
+    if row and row[0]==desired and not force:return
+    db.execute("insert into folder_routes(principal,target,slot,desired,queued_at) values(?,?,?,?,?) on conflict(principal,target) do update set slot=excluded.slot,desired=excluded.desired,revision=folder_routes.revision+1,queued_at=excluded.queued_at,error='',next_attempt_at=''",(str(principal),str(target),slot,desired,stamp()));db.commit()
+def seed_folder_routes():
+    # Catch up existing confirmed DMs once, without resetting already tracked transitions.
+    for principal,target,slot,last_at in db.execute("select principal,target,slot,max(at) from outbox where kind='dm' and status='Sent' group by principal,target").fetchall():
+        if db.execute('select 1 from folder_routes where principal=? and target=?',(principal,target)).fetchone():continue
+        replied=db.execute('select 1 from replies where principal=? and target=? and at>=? limit 1',(principal,target,datetime.fromisoformat(last_at).replace(microsecond=0).isoformat())).fetchone()
+        queue_folder_route(principal,target,slot,'🟡' if replied else '🔵')
+def folder_route_records(target,principals):
+    rows=db.execute('select principal,slot,desired,applied,revision,applied_revision,checked_at,error from folder_routes where target=? order by queued_at desc',(target,)).fetchall()
+    return [{'account_id':slot,'desired':desired,'applied':applied,'status':'Needs attention' if error else 'Synced' if revision==applied_revision else 'Pending','checked_at':checked,'error':error} for principal,slot,desired,applied,revision,applied_revision,checked,error in rows if principal in principals]
+def folder_title(folder):
+    title=getattr(folder,'title','');return str(getattr(title,'text',title)).strip().replace('\ufe0f','')
+def matching_folder(filters,title):
+    matches=[f for f in filters if folder_title(f)==title]
+    if len(matches)>1:raise HTTPException(409,f'Multiple {title} folders exist. Give the intended folder a unique name before retrying.')
+    if matches and not isinstance(matches[0],types.DialogFilter):raise HTTPException(409,f'{title} must be a personal Telegram folder, not a shared folder.')
+    return matches[0] if matches else None
+def same_folder_peer(peer,target,principal):
+    return str(getattr(peer,'user_id',''))==str(target) or (isinstance(peer,types.InputPeerSelf) and str(target)==str(principal))
+async def fetch_folders(client):
+    result=await client(functions.messages.GetDialogFiltersRequest())
+    return list(getattr(result,'filters',result if isinstance(result,(list,tuple)) else []))
+async def save_folder(client,folder):
+    if not await client(functions.messages.UpdateDialogFilterRequest(id=folder.id,filter=folder)):raise HTTPException(502,'Telegram did not confirm the folder update. Retry folder sync.')
+async def move_chat_folder(client,principal,target,desired):
+    peer=await client.get_input_entity(int(target));filters=await fetch_folders(client)
+    destination=matching_folder(filters,desired)
+    if destination is None:
+        used={getattr(f,'id',0) for f in filters}
+        folder_id=next((i for i in range(2,256) if i not in used),None)
+        if folder_id is None:raise HTTPException(409,'No free Telegram folder ID is available.')
+        template=db.execute('select folder_id,body from empty_folder_templates where principal=? and title=?',(principal,desired)).fetchone()
+        if template:
+            with BinaryReader(template[1]) as reader:destination=reader.tgread_object()
+            if not isinstance(destination,types.DialogFilter) or folder_title(destination)!=desired:raise HTTPException(409,'The saved empty-folder settings need to be recreated in Telegram.')
+            destination.id=template[0] if template[0] not in used else folder_id
+            destination.include_peers=[peer]
+            destination.exclude_peers=[p for p in destination.exclude_peers if not same_folder_peer(p,target,principal)]
+        else:
+            title=types.TextWithEntities(text=desired,entities=[])
+            destination=types.DialogFilter(id=folder_id,title=title,pinned_peers=[],include_peers=[peer],exclude_peers=[])
+        await save_folder(client,destination)
+    else:
+        destination=copy.deepcopy(destination);before=destination.to_dict()
+        destination.exclude_peers=[p for p in destination.exclude_peers if not same_folder_peer(p,target,principal)]
+        if not any(same_folder_peer(p,target,principal) for p in destination.include_peers+destination.pinned_peers):destination.include_peers.append(peer)
+        if destination.to_dict()!=before:await save_folder(client,destination)
+    # Fetch again so that edits made in Telegram while adding the destination are retained.
+    opposite='🟡' if desired=='🔵' else '🔵'
+    source=matching_folder(await fetch_folders(client),opposite)
+    if source is None:return
+    source=copy.deepcopy(source);before=source.to_dict()
+    source.include_peers=[p for p in source.include_peers if not same_folder_peer(p,target,principal)]
+    source.pinned_peers=[p for p in source.pinned_peers if not same_folder_peer(p,target,principal)]
+    if any(getattr(source,name,False) for name in ('contacts','non_contacts','groups','broadcasts','bots')) and not any(same_folder_peer(p,target,principal) for p in source.exclude_peers):source.exclude_peers.append(peer)
+    if source.to_dict()!=before:
+        try:await save_folder(client,source)
+        except errors.FilterIncludeEmptyError:
+            if source.include_peers or source.pinned_peers or any(getattr(source,name,False) for name in ('contacts','non_contacts','groups','broadcasts','bots')):raise
+            # Telegram cannot keep an explicit-only folder with no chats. Retain its exact settings
+            # before removing just the now-empty routing folder; chats are never deleted.
+            db.execute('insert or replace into empty_folder_templates values(?,?,?,?)',(principal,opposite,source.id,sqlite3.Binary(bytes(source))));db.commit()
+            if not await client(functions.messages.UpdateDialogFilterRequest(id=source.id)):raise HTTPException(502,'Telegram did not confirm the empty-folder update.')
+async def folder_client(principal,preferred):
+    for slot in [preferred]+[other for other in (1,2,3) if other!=preferred]:
+        if slot not in clients:continue
+        try:
+            client=await ready(slot);me=await client.get_me()
+            if str(me.id)==principal:return client,slot
+        except (HTTPException,errors.RPCError,OSError):continue
+    raise HTTPException(409,'Reconnect the original Telegram sender to sync this chat folder.')
+async def sync_folder_routes(key=None,limit=1):
+    results=[]
+    async with lock:
+        seed_folder_routes()
+        rows=db.execute("select r.principal,r.target,r.slot,r.desired,r.revision from folder_routes r left join folder_pauses p on p.principal=r.principal where r.revision!=r.applied_revision and r.next_attempt_at<=? and (p.until_at is null or p.until_at<=?) order by r.queued_at",(stamp(),stamp())).fetchall()
+        if key:rows=[r for r in rows if key=='dm:'+r[1]]
+        for principal,target,slot,desired,revision in rows[:limit]:
+            try:
+                client,slot=await folder_client(principal,slot)
+                await asyncio.wait_for(move_chat_folder(client,principal,target,desired),timeout=20)
+                db.execute("update folder_routes set slot=?,applied=?,applied_revision=?,checked_at=?,error='',next_attempt_at='' where principal=? and target=? and revision=?",(slot,desired,revision,stamp(),principal,target,revision));db.commit()
+                results.append({'target':target,'ok':True,'folder':desired})
+            except Exception as exc:
+                detail=exc.detail if isinstance(exc,HTTPException) else 'Telegram folder sync failed. Check the folder names and account folder limits, then retry.'
+                delay=300
+                if isinstance(exc,errors.FloodWaitError):
+                    delay=max(300,exc.seconds+5);detail=f'Telegram requests a {exc.seconds}s wait before folder changes.'
+                    db.execute('insert or replace into folder_pauses values(?,?,?)',(principal,(datetime.now(timezone.utc)+timedelta(seconds=delay)).isoformat(),detail))
+                elif type(exc).__name__=='FilterIncludeEmptyError':detail='Telegram rejected an empty source folder. Manage its last chat in Telegram, then retry folder sync.'
+                elif isinstance(exc,asyncio.TimeoutError):detail='Telegram folder sync timed out. The message is still sent; retry folder sync only.'
+                db.execute('update folder_routes set slot=?,checked_at=?,error=?,next_attempt_at=? where principal=? and target=? and revision=?',(slot,stamp(),detail,(datetime.now(timezone.utc)+timedelta(seconds=delay)).isoformat(),principal,target,revision));db.commit()
+                results.append({'target':target,'ok':False,'error':detail})
+        return {'checked':len(results),'remaining':max(0,len(rows)-len(results)),'results':results}
+@app.post('/folders/sync',dependencies=[Depends(auth)])
+async def check_chat_folders(body:ReplySync):
+    if body.key and (not body.key.startswith('dm:') or not any(l['key']==body.key and l['last_sent_at'] for l in lead_records())):raise HTTPException(400,'Choose a contacted direct-message lead.')
+    # Manual retries may clear a per-chat delay, but never bypass an account's Telegram wait.
+    if body.key:db.execute("update folder_routes set next_attempt_at='' where target=?",(body.key.split(':',1)[1],));db.commit()
+    return await sync_folder_routes(body.key,limit=3)
+async def folder_routing_loop():
+    while True:
+        await asyncio.sleep(5)
+        try:await sync_folder_routes(limit=1)
+        except asyncio.CancelledError:raise
+        except Exception:pass
+
 @app.on_event('startup')
 async def start():
-    global reply_task
+    global reply_task,folder_task
+    seed_folder_routes()
     for slot in (1,2,3):
         try:
             c=make_client(slot)
             if c:clients[slot]=c;await c.connect()
         except Exception:startup_errors[slot]='Telegram connection unavailable. Reconnect this account in Connections.'
     reply_task=asyncio.create_task(reply_sync_loop())
+    folder_task=asyncio.create_task(folder_routing_loop())
 @app.on_event('shutdown')
 async def stop():
-    if reply_task:
-        reply_task.cancel()
-        try:await reply_task
-        except asyncio.CancelledError:pass
+    for task in (reply_task,folder_task):
+        if task:
+            task.cancel()
+            try:await task
+            except asyncio.CancelledError:pass
     for c in clients.values():await c.disconnect()
 @app.exception_handler(errors.FloodWaitError)
 async def flood(request,exc):
@@ -357,7 +480,7 @@ class ResetQuota(Account):
     request_id:str=Field(min_length=8,max_length=128)
 class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
-async def health():return {'service':'teamradar','ok':True,'version':'3.2'}
+async def health():return {'service':'teamradar','ok':True,'version':'3.3'}
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -391,7 +514,7 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,''))})
-    return {'version':'3.2','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True}}
+    return {'version':'3.3','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True}}
 @app.post('/reset-daily-limits',dependencies=[Depends(auth)])
 async def reset_daily_limits(body:ResetQuota):
     async with lock:
@@ -587,7 +710,7 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             db.execute('insert into outbox values(?,?,?,?,?,?,?,?,?,?,?)',(delivery_id,principal,slot,kind,target,cid,'Sending',date,stamp(),'',digest))
             db.execute('insert into message_details(delivery_id,body,recipient_name,username,sender_label,followup_of,token_symbol) values(?,?,?,?,?,?,?)',(delivery_id,text,contact['name'],contact.get('username',''),sender_label,followup_of,symbol))
             if followup_of:db.execute('insert into followup_requests values(?,?,?,?)',(request_id,delivery_id,followup_of,digest))
-        try:await c.send_message(peer,text)
+        try:sent_message=await c.send_message(peer,text)
         except errors.FloodWaitError as exc:
             blocked=(datetime.now(timezone.utc)+timedelta(seconds=exc.seconds)).isoformat()
             db.execute('update account_info set blocked_until=? where principal=?',(blocked,principal))
@@ -600,6 +723,9 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             db.execute('update outbox set status=?,error=? where id=?',('Uncertain','Check Telegram before retrying',delivery_id));db.commit();raise HTTPException(502,'Delivery uncertain. Check Telegram before retrying.')
         db.execute('update outbox set status=?,at=? where id=?',('Sent',stamp(),delivery_id));db.commit()
         advance_lead(kind+':'+target,'Contacted')
+        if kind=='dm':
+            db.execute('update message_details set telegram_message_id=? where delivery_id=?',(getattr(sent_message,'id',0) or 0,delivery_id));db.commit()
+            queue_folder_route(principal,target,slot,'🔵',force=True)
         return {'status':'Sent','id':cid,'account_id':slot,'kind':kind,'usage':usage(principal)}
 @app.post('/send',dependencies=[Depends(auth)])
 async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message,token_symbol=body.token_symbol)
