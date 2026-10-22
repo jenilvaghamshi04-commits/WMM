@@ -15,7 +15,7 @@ API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
 app=FastAPI(title='WMM Team',version='3.4')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
-lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock()
+lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
 db.execute('create table if not exists contacts(id text primary key, data text)')
 db.execute('create table if not exists settings(id integer primary key, data text)')
@@ -43,6 +43,8 @@ db.execute("create table if not exists auto_yes_jobs(id text primary key,princip
 for table,column,declaration in [('auto_yes_enrollments','no_reply',"TEXT NOT NULL DEFAULT ''"),('auto_yes_jobs','branch',"TEXT NOT NULL DEFAULT 'yes'")]:
     if column not in [r[1] for r in db.execute('pragma table_info('+table+')')]:db.execute('alter table '+table+' add column '+column+' '+declaration)
 db.execute("update auto_yes_jobs set status='Pending' where status='Sending'")
+db.execute("create table if not exists auto_followup_jobs(root_id text primary key,principal text,target text unique,slot integer,contact_id text,due_at text,token_symbol text,exchange text,body text not null default '',status text not null default 'Scheduled',error text not null default '',next_attempt_at text not null default '')")
+db.execute("update auto_followup_jobs set status='Pending' where status='Sending'")
 db.execute('create index if not exists reply_target on replies(target,at)')
 db.execute('create table if not exists reply_sync(principal text, target text, cursor integer not null default 0, checked_at text, next_check_at text, complete integer not null default 0, error text, primary key(principal,target))')
 # Preserve confirmed legacy deliveries when upgrading from the single-account version.
@@ -104,7 +106,7 @@ DEFAULT_YES_DEMO="We can give you a free demo also\nIf you have time we can jump
 DEFAULT_NO_REPLY="We can also offer a free demo so you can see how we work before making a decision. Would you be open to a quick call to discuss what could work for your project?"
 def settings():
     r=db.execute('select data from settings where id=1').fetchone()
-    return {'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'','yes_pitch_template':DEFAULT_YES_PITCH,'yes_demo_template':DEFAULT_YES_DEMO,'no_reply_template':DEFAULT_NO_REPLY,'auto_yes_enabled':True,**(json.loads(r[0]) if r else {})}
+    return {'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'','yes_pitch_template':DEFAULT_YES_PITCH,'yes_demo_template':DEFAULT_YES_DEMO,'no_reply_template':DEFAULT_NO_REPLY,'auto_yes_enabled':True,'auto_followup_enabled':True,**(json.loads(r[0]) if r else {})}
 def contacts():
     rows=[c for r in db.execute('select data from contacts order by rowid desc') if not (c:=json.loads(r[0])).get('is_bot',False)]
     return sorted(rows,key=lambda c:c.get('scanned_at') or '',reverse=True)
@@ -257,7 +259,7 @@ def lead_records():
         sync_error=next((r[3] for r in sync_rows if r[3]),'')
         fully_checked=bool(principals and len(sync_rows)==len(principals) and all(r[2] and not r[3] for r in sync_rows))
         last_activity=max([contact.get('scanned_at') or '',cfg['updated_at'] or '',latest_reply['at'] if replied else '',rows[0]['at'] if rows else ''])
-        result.append({'key':key,'contact_id':contact['id'],'name':contact.get('name',target),'username':contact.get('username',''),'group':contact.get('group',''),'kind':kind,'target':target,'stage':stage,'reply_status':'Replied' if replied else 'Awaiting reply' if sent and kind=='dm' else 'Not tracked' if kind=='group' else 'Not contacted','latest_reply':latest_reply,'replies':replies,'needs_attention':bool(replied and latest_reply['at']>cfg['acknowledged_at'] and stage!='Client'),'reminder_days':cfg['reminder_days'],'reminders_enabled':bool(cfg['reminders_enabled']),'reminder_active':reminder_active,'due_at':due_at if reminder_active else None,'followup_due':bool(reminder_active and datetime.fromisoformat(due_at)<=now),'reminder_reason':'Stopped — reply received' if replied else 'Complete' if stage=='Client' else 'Paused' if not cfg['reminders_enabled'] else 'Review uncertain delivery' if pending else 'Direct messages only' if kind=='group' else 'Waiting for first send' if not last_sent else 'Scheduled','last_sent_at':last_sent['at'] if last_sent else None,'followup_delivery_id':last_sent['delivery_id'] if last_sent else None,'last_activity_at':last_activity,'sync_checked_at':max([r[1] or '' for r in sync_rows],default=''),'sync_complete':fully_checked,'sync_error':sync_error,'folder_routes':folder_route_records(target,principals) if kind=='dm' else [],'auto_yes':auto_yes_summary(target,principals) if kind=='dm' else None})
+        result.append({'key':key,'contact_id':contact['id'],'name':contact.get('name',target),'username':contact.get('username',''),'group':contact.get('group',''),'kind':kind,'target':target,'stage':stage,'reply_status':'Replied' if replied else 'Awaiting reply' if sent and kind=='dm' else 'Not tracked' if kind=='group' else 'Not contacted','latest_reply':latest_reply,'replies':replies,'needs_attention':bool(replied and latest_reply['at']>cfg['acknowledged_at'] and stage!='Client'),'reminder_days':cfg['reminder_days'],'reminders_enabled':bool(cfg['reminders_enabled']),'reminder_active':reminder_active,'due_at':due_at if reminder_active else None,'followup_due':bool(reminder_active and datetime.fromisoformat(due_at)<=now),'reminder_reason':'Stopped — reply received' if replied else 'Complete' if stage=='Client' else 'Paused' if not cfg['reminders_enabled'] else 'Review uncertain delivery' if pending else 'Direct messages only' if kind=='group' else 'Waiting for first send' if not last_sent else 'Scheduled','last_sent_at':last_sent['at'] if last_sent else None,'followup_delivery_id':last_sent['delivery_id'] if last_sent else None,'last_activity_at':last_activity,'sync_checked_at':max([r[1] or '' for r in sync_rows],default=''),'sync_complete':fully_checked,'sync_error':sync_error,'folder_routes':folder_route_records(target,principals) if kind=='dm' else [],'auto_followup':auto_followup_summary(target) if kind=='dm' else None,'auto_yes':auto_yes_summary(target,principals) if kind=='dm' else None})
     return sorted(result,key=lambda r:r['last_activity_at'],reverse=True)
 
 class LeadUpdate(BaseModel):
@@ -412,7 +414,7 @@ async def folder_client(principal,preferred):
 async def sync_folder_routes(key=None,limit=1):
     results=[]
     async with lock:
-        seed_folder_routes()
+        seed_folder_routes();seed_auto_followups()
         rows=db.execute("select r.principal,r.target,r.slot,r.desired,r.revision from folder_routes r left join folder_pauses p on p.principal=r.principal where r.revision!=r.applied_revision and r.next_attempt_at<=? and (p.until_at is null or p.until_at<=?) order by r.queued_at",(stamp(),stamp())).fetchall()
         if key:rows=[r for r in rows if key=='dm:'+r[1]]
         for principal,target,slot,desired,revision in rows[:limit]:
@@ -534,10 +536,98 @@ async def auto_yes_loop():
         except asyncio.CancelledError:raise
         except Exception:pass
 
+# One automatic follow-up per conversation, 72 hours after its first confirmed DM.
+def seed_auto_followups():
+    rows=db.execute("select o.id,o.principal,o.target,o.slot,o.contact_id,o.at,coalesce(d.token_symbol,''),coalesce(d.exchange,'') from outbox o left join message_details d on d.delivery_id=o.id where o.kind='dm' and o.status='Sent' and d.followup_of is null order by o.at,o.rowid").fetchall()
+    for root,principal,target,slot,cid,at,token,exchange in rows:
+        due=(datetime.fromisoformat(at)+timedelta(days=3)).isoformat()
+        db.execute("insert or ignore into auto_followup_jobs(root_id,principal,target,slot,contact_id,due_at,token_symbol,exchange) values(?,?,?,?,?,?,?,?)",(root,principal,target,slot,cid,due,token,exchange))
+    db.commit()
+def auto_followup_gate(job):
+    root,principal,target=job[:3]
+    source=db.execute("select principal,target,kind,status from outbox where id=?",(root,)).fetchone()
+    if source!=(principal,target,'dm','Sent'):return 'Cancelled','Original delivery is unavailable'
+    if db.execute('select 1 from replies where target=? limit 1',(target,)).fetchone():return 'Cancelled','Stopped — reply received'
+    if lead_config('dm:'+target)['stage'] in ('Replied','Meeting','Proposal','Client'):return 'Cancelled','Stopped — lead has progressed'
+    own=db.execute('select delivery_id from followup_requests where request_id=?',('auto-followup:'+root,)).fetchone()
+    if db.execute("select 1 from outbox o join message_details d on d.delivery_id=o.id where o.target=? and o.kind='dm' and o.status='Sent' and d.followup_of is not null and o.id!=? limit 1",(target,own[0] if own else '')).fetchone():return 'Cancelled','A follow-up has already been sent'
+    if not settings()['auto_followup_enabled'] or not lead_config('dm:'+target)['reminders_enabled']:return 'Paused','Automatic follow-up paused'
+    if db.execute("select 1 from outbox where target=? and kind='dm' and status in ('Sending','Uncertain') limit 1",(target,)).fetchone():return 'Needs attention','Review uncertain delivery before sending'
+    return None,''
+def auto_followup_summary(target):
+    row=db.execute('select root_id,principal,target,slot,due_at,status,error from auto_followup_jobs where target=?',(target,)).fetchone()
+    if not row:
+        root=db.execute("select o.id,o.principal,o.target,o.slot,o.at from outbox o left join message_details d on d.delivery_id=o.id where o.kind='dm' and o.status='Sent' and o.target=? and d.followup_of is null order by o.at,o.rowid limit 1",(target,)).fetchone()
+        if not root:return None
+        row=(*root[:4],(datetime.fromisoformat(root[4])+timedelta(days=3)).isoformat(),'Scheduled','')
+    root,principal,target,slot,due,status,error=row
+    if status not in ('Complete','Cancelled','Needs attention'):
+        gate,reason=auto_followup_gate((root,principal,target))
+        if gate:status,error=gate,reason
+    current=db.execute('select slot from account_info where principal=? order by slot limit 1',(principal,)).fetchone()
+    return {'root_id':root,'principal':principal,'account_id':current[0] if current else slot,'due_at':due,'status':status,'error':error,'days':3,'enabled':bool(settings()['auto_followup_enabled'] and lead_config('dm:'+target)['reminders_enabled'])}
+def validate_auto_followup_send(root_id,principal,target):
+    row=db.execute('select root_id,principal,target,due_at,status from auto_followup_jobs where root_id=?',(root_id,)).fetchone()
+    if not row or row[1:3]!=(principal,target):raise HTTPException(409,'Automatic follow-up must use the first message sender and recipient')
+    if row[4] in ('Cancelled','Complete','Needs attention'):raise HTTPException(409,'This automatic follow-up is no longer pending')
+    gate,reason=auto_followup_gate(row)
+    if gate:raise HTTPException(423 if gate=='Paused' else 409,reason)
+    if datetime.fromisoformat(row[3])>datetime.now(timezone.utc):raise HTTPException(409,'The three-day follow-up is not due yet')
+    sync=db.execute('select checked_at,complete,error from reply_sync where principal=? and target=?',(principal,target)).fetchone()
+    if not sync or not sync[1] or sync[2] or not sync[0] or datetime.now(timezone.utc)-datetime.fromisoformat(sync[0])>timedelta(minutes=2):raise HTTPException(409,'Reply history must be fully checked before the automatic follow-up')
+async def process_auto_followups(limit=1):
+    async with auto_followup_lock:
+        seed_auto_followups()
+        if not settings()['auto_followup_enabled']:return {'processed':0,'results':[]}
+        rows=db.execute("select root_id,principal,target,slot,contact_id,due_at,token_symbol,exchange,body from auto_followup_jobs where status in ('Scheduled','Pending','Paused','Waiting') and due_at<=? and next_attempt_at<=? order by due_at limit ?",(stamp(),stamp(),limit)).fetchall();results=[]
+        for root,principal,target,preferred,cid,due,token,exchange,body in rows:
+            state='Waiting';error='';retry=''
+            try:
+                gate,reason=auto_followup_gate((root,principal,target))
+                if gate:
+                    state=gate;raise HTTPException(423 if gate=='Paused' else 409,reason)
+                try:client,slot=await folder_client(principal,preferred)
+                except (HTTPException,errors.RPCError,OSError):raise HTTPException(503,'Reconnect the original sender; no other account will be used')
+                first=db.execute('select at from outbox where id=?',(root,)).fetchone()[0]
+                sync=await sync_reply_pair(principal,target,slot,first)
+                gate,reason=auto_followup_gate((root,principal,target))
+                if gate:
+                    state=gate;raise HTTPException(423 if gate=='Paused' else 409,reason)
+                if not sync.get('ok') or not sync.get('complete'):raise HTTPException(503,sync.get('error') or 'Waiting for the remaining reply history to be checked')
+                if not body:
+                    contact=db.execute('select data from contacts where id=?',(cid,)).fetchone()
+                    if not contact:state='Needs attention';raise HTTPException(409,'Saved recipient is unavailable')
+                    body=personalize_message(settings()['followup_template'],json.loads(contact[0]),token,exchange)
+                    db.execute('update auto_followup_jobs set body=? where root_id=?',(body,root));db.commit()
+                db.execute("update auto_followup_jobs set status='Sending' where root_id=?",(root,));db.commit()
+                await deliver(cid,slot,'dm',body,followup_of=root,request_id='auto-followup:'+root,expected_principal=principal,token_symbol=token,exchange=exchange,automatic_followup=root)
+                state='Complete'
+            except Exception as exc:
+                error=str(exc.detail) if isinstance(exc,HTTPException) else 'Automatic follow-up failed. Check delivery history.'
+                attempt=db.execute('select o.status from followup_requests f join outbox o on o.id=f.delivery_id where f.request_id=?',('auto-followup:'+root,)).fetchone()
+                if attempt and attempt[0]=='Sent':state='Complete';error=''
+                elif attempt:state='Needs attention'
+                elif isinstance(exc,HTTPException) and exc.status_code in (429,503):state='Waiting'
+                elif isinstance(exc,HTTPException) and exc.status_code==423:state='Paused'
+                elif state=='Waiting':
+                    gate,reason=auto_followup_gate((root,principal,target))
+                    state=gate or 'Needs attention'
+                    if gate:error=reason
+                if state in ('Waiting','Paused'):retry=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
+            db.execute('update auto_followup_jobs set status=?,error=?,next_attempt_at=? where root_id=?',(state,error,retry,root));db.commit()
+            results.append({'root_id':root,'status':state,'error':error})
+        return {'processed':len(results),'results':results}
+async def auto_followup_loop():
+    while True:
+        await asyncio.sleep(30)
+        try:await process_auto_followups(limit=1)
+        except asyncio.CancelledError:raise
+        except Exception:pass
+
 @app.on_event('startup')
 async def start():
-    global reply_task,folder_task,auto_yes_task
-    seed_folder_routes()
+    global reply_task,folder_task,auto_yes_task,auto_followup_task
+    seed_folder_routes();seed_auto_followups()
     for slot in (1,2,3):
         try:
             c=make_client(slot)
@@ -546,9 +636,10 @@ async def start():
     reply_task=asyncio.create_task(reply_sync_loop())
     folder_task=asyncio.create_task(folder_routing_loop())
     auto_yes_task=asyncio.create_task(auto_yes_loop())
+    auto_followup_task=asyncio.create_task(auto_followup_loop())
 @app.on_event('shutdown')
 async def stop():
-    for task in (reply_task,folder_task,auto_yes_task):
+    for task in (reply_task,folder_task,auto_yes_task,auto_followup_task):
         if task:
             task.cancel()
             try:await task
@@ -574,6 +665,7 @@ class Templates(BaseModel):
     yes_demo_template:str|None=Field(default=None,min_length=1,max_length=4096)
     no_reply_template:str|None=Field(default=None,min_length=1,max_length=4096)
     auto_yes_enabled:bool|None=None
+    auto_followup_enabled:bool|None=None
 class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None;token_symbol:str|None=Field(default=None,max_length=33);exchange:str=Field(default='',max_length=64);auto_yes:bool=False
 class SheetSend(BaseModel):id:str
 class Followup(BaseModel):
@@ -586,7 +678,7 @@ class ResetQuota(Account):
     request_id:str=Field(min_length=8,max_length=128)
 class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
-async def health():return {'service':'teamradar','ok':True,'version':'3.4'}
+async def health():return {'service':'teamradar','ok':True,'version':'3.5'}
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -620,7 +712,7 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),**login_progress(slot)})
-    return {'version':'3.4','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True}}
+    return {'version':'3.5','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True}}
 @app.post('/reset-daily-limits',dependencies=[Depends(auth)])
 async def reset_daily_limits(body:ResetQuota):
     async with lock:
@@ -823,7 +915,7 @@ def personalize_message(text,contact,token_symbol='',exchange=''):
     text=text.replace('{{token}}','$'+symbol if symbol else '')
     return re.sub(r'[$@]TOKEN\b',lambda match:'$'+symbol,text)
 
-async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=None,expected_principal=None,token_symbol=None,exchange='',auto_yes=False,automation_job=None,automation_step=0):
+async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=None,expected_principal=None,token_symbol=None,exchange='',auto_yes=False,automation_job=None,automation_step=0,automatic_followup=None):
     async with lock:
         c=await ready(slot);principal=await identify(slot,c)
         row=db.execute('select data from contacts where id=?',(cid,)).fetchone()
@@ -837,6 +929,14 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if not text:raise HTTPException(400,'Write your message before sending')
         symbol=normalize_token(settings().get('token_symbol','') if token_symbol is None else token_symbol)
         exchange=normalize_exchange(exchange)
+        if followup_of:
+            parent=db.execute('select principal,target,kind,status from outbox where id=?',(followup_of,)).fetchone()
+            destination=str(contact['group_id'] if kind=='group' else contact['user_id'])
+            if parent!=(principal,destination,kind,'Sent'):raise HTTPException(409,'Every follow-up must use the original Telegram sender and recipient')
+            if kind=='dm':
+                first_sender=db.execute("select o.principal from outbox o left join message_details d on d.delivery_id=o.id where o.kind='dm' and o.target=? and o.status='Sent' and d.followup_of is null order by o.at,o.rowid limit 1",(destination,)).fetchone()
+                if not first_sender or first_sender[0]!=principal:raise HTTPException(409,'All conversation messages must stay with the first message sender')
+        if automatic_followup:validate_auto_followup_send(automatic_followup,principal,str(contact['user_id']))
         if automation_job:validate_auto_yes_send(automation_job,principal,str(contact['user_id']))
         yes_cfg=settings() if auto_yes else None
         if auto_yes:
@@ -910,6 +1010,8 @@ async def follow_up(body:Followup):
     if not parent:raise HTTPException(404,'Original message not found')
     principal,slot,kind,cid,status=parent
     if status!='Sent':raise HTTPException(409,'Follow-ups require a confirmed sent message')
+    try:client,slot=await folder_client(principal,slot)
+    except HTTPException:raise HTTPException(409,'Reconnect the original sender to send this follow-up. No other Telegram account will be used.')
     saved_token=db.execute('select token_symbol,exchange from message_details where delivery_id=?',(body.delivery_id,)).fetchone()
     symbol=body.token_symbol if body.token_symbol is not None else (saved_token[0] if saved_token else '')
     return await deliver(cid,slot,kind,body.message,followup_of=body.delivery_id,request_id=body.request_id,expected_principal=principal,token_symbol=symbol,exchange=saved_token[1] if saved_token else '')

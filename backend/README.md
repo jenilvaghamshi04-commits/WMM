@@ -23,3 +23,14 @@ WMM Team v3 adds dashboard login: admin / DASHBOARD_KEY by default, or configure
 
 
 Automatic replies (v3.4): deploy the latest commit, then choose a token/exchange and enable automatic yes / no replies in a new Saved data send preview. The gateway must remain online to detect incoming replies. Clear yes replies send the pitch then the demo/call invitation; clear no replies send the free-demo offer once. Edit all five texts in Message templates, pause globally there, or pause a pending contact in Lead / replies. New enrollments snapshot the selected context and texts; older conversations remain unarmed. Failed/uncertain automated deliveries stop for review. Existing Telegram waits and daily recipient limits remain enforced.
+
+
+## Automatic three-day follow-up and complete message library (v3.5)
+
+Message templates now lists all five messages in one library: introduction, three-day/manual follow-up, yes pitch, yes call invitation, and no free-demo offer. Every card has an editor, default reset and personalized preview; navigation links at the top jump directly to any card. The global three-day-follow-up switch is saved with templates. Deploy this commit on Render to update its dashboard and backend together.
+
+The gateway automatically schedules one follow-up 72 hours after the first confirmed DM, including existing unreplied conversations. It uses the saved follow-up template and the original token/exchange. It does not repeat every three days. Before sending, the original account must finish a fresh reply-history check; incomplete or unavailable history waits. Any detected reply, a progressed lead (Replied/Meeting/Proposal/Client), or an already confirmed follow-up stops the scheduled send. A paused lead reminder also pauses its automatic follow-up. Group posts are excluded.
+
+All follow-ups and automatic yes/no replies use the original Telegram identity. Moving that identity to another account slot is supported; replacing its slot with a different account never authorizes a send. The server checks the parent recipient/sender and first DM sender under its delivery lock. If the original account is disconnected, jobs wait without switching identity. The gateway must remain online; overdue eligible jobs resume after reconnect. Daily quotas, Telegram waits, uncertain-delivery protection and existing duplicate safeguards still apply.
+
+SQLite persists each scheduled job and fixed request ID. A confirmed send survives a restart without being repeated; failed or uncertain attempts stop for review. Saved data and Lead / replies display status, due date and the original sender. `POST /templates` accepts optional `auto_followup_enabled` (default true); older template/config updates preserve it. `/status` advertises `automatic_followups` and `original_sender_lock`, and includes an `auto_followup` summary on DM leads.
