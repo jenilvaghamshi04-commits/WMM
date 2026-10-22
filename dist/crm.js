@@ -4,9 +4,10 @@ function crmLead(contact){return leads.find(lead=>lead.key===crmKey(contact))}
 function crmDate(value){return value?new Date(value).toLocaleString():'Not checked'}
 function leadBadges(lead){
   if(!lead)return '<div class="sentmeta">Lead tracking: deploy the latest gateway.</div>';
-  return '<div class="crm-badges"><span class="crm-badge '+(lead.reply_status==='Replied'?'replied':'')+'">'+esc(lead.reply_status)+'</span><span class="crm-badge">Stage: '+esc(lead.stage)+'</span>'+(lead.needs_attention?'<span class="crm-badge attention">Reply needs attention</span>':'')+(lead.followup_due&&!WMMMessageModel.hasReplied(lead)?'<span class="crm-badge attention">Follow-up due</span>':'')+'</div>'+(lead.due_at&&!WMMMessageModel.hasReplied(lead)?'<div class="sentmeta">Follow-up '+(lead.followup_due&&!WMMMessageModel.hasReplied(lead)?'due ':'scheduled ')+esc(crmDate(lead.due_at))+'</div>':'')+(lead.latest_reply?'<div class="crm-snippet">'+esc(lead.latest_reply.body.slice(0,130))+'</div>':'')+(lead.sync_error?'<div class="deliverydetail">'+esc(lead.sync_error)+'</div>':'')+folderBadges(lead);
+  return '<div class="crm-badges"><span class="crm-badge '+(lead.reply_status==='Replied'?'replied':'')+'">'+esc(lead.reply_status)+'</span><span class="crm-badge">Stage: '+esc(lead.stage)+'</span>'+(lead.needs_attention?'<span class="crm-badge attention">Reply needs attention</span>':'')+(lead.followup_due&&!WMMMessageModel.hasReplied(lead)?'<span class="crm-badge attention">Follow-up due</span>':'')+'</div>'+(lead.due_at&&!WMMMessageModel.hasReplied(lead)?'<div class="sentmeta">Follow-up '+(lead.followup_due&&!WMMMessageModel.hasReplied(lead)?'due ':'scheduled ')+esc(crmDate(lead.due_at))+'</div>':'')+(lead.latest_reply?'<div class="crm-snippet">'+esc(lead.latest_reply.body.slice(0,130))+'</div>':'')+(lead.sync_error?'<div class="deliverydetail">'+esc(lead.sync_error)+'</div>':'')+folderBadges(lead)+autoReplyBadges(lead);
 }
 function folderBadges(lead){return (lead.folder_routes||[]).map(route=>'<div class="crm-folder-route '+(route.desired==='🔵'?'blue':'yellow')+'"><span>'+(route.status==='Synced'?'Telegram folder: ':route.status==='Pending'?'Moving to folder: ':'Folder needs attention: ')+esc(route.desired)+' · Account '+esc(route.account_id)+'</span>'+(route.error?'<div class="deliverydetail">'+esc(route.error)+'</div>':'')+'</div>').join('')}
+function autoReplyBadges(lead){const a=lead.auto_yes;if(!a)return '';return '<div class="crm-snippet"><b>Automatic replies: '+esc(a.status)+'</b><div class="sentmeta">'+esc(a.exchange_name)+' · $'+esc(a.token_symbol)+(a.branch?' · '+esc(a.branch==='yes'?'Yes reply':'No reply')+' · '+a.sent_parts+'/'+a.total_parts+' messages sent':'')+'</div>'+(a.error?'<div class="deliverydetail">'+esc(a.error)+'</div>':'')+'</div>'}
 function bindLeadActions(container){
   container.querySelectorAll('[data-lead]').forEach(b=>b.onclick=()=>openLead(b.dataset.lead));
   container.querySelectorAll('[data-due]').forEach(b=>b.onclick=()=>action(b,()=>reviewDueFollowup(b.dataset.due)));
@@ -31,7 +32,7 @@ function populateLead(lead){
   $('#leadReplies').innerHTML=lead.replies.length?lead.replies.map(reply=>'<article class="reply-entry"><div class="sentmeta">Received · Account '+esc(reply.account_id)+' · '+esc(crmDate(reply.at))+'</div><div class="crm-reply-body">'+esc(reply.body)+'</div></article>').join(''):'<p class="hint" style="padding:16px 0">'+(lead.kind==='group'?'Group messages are not used for individual reply detection.':'No reply has been detected after the first confirmed message.')+'</p>';
   if(lead.kind==='dm'&&lead.last_sent_at)$('#leadReplies').insertAdjacentHTML('beforeend','<p class="hint">History checked: '+esc(crmDate(lead.sync_checked_at))+(lead.sync_complete?' · Up to date at that check':' · '+(lead.sync_error||'More history may need checking'))+'</p>');
   $('#syncLeadFolders').hidden=lead.kind!=='dm'||!lead.last_sent_at||!serverFeatures.telegram_folder_routing;
-  $('#leadSaveState').textContent='';
+  const auto=lead.auto_yes;$('#toggleAutoReplies').hidden=!auto||['Complete','Cancelled','Needs attention'].includes(auto.status);$('#toggleAutoReplies').textContent=auto?.enabled?'Pause automatic replies':'Resume automatic replies';$('#leadSaveState').textContent='';
 }
 function openLead(key){
   if(!live||!serverFeatures.lead_management){toast('Deploy the latest gateway commit on Render to enable lead management.');return}
@@ -53,6 +54,7 @@ async function reviewDueFollowup(key){
 document.addEventListener('DOMContentLoaded',()=>{
   for(const selector of ['#leadSearch','#leadFilter','#leadType'])$(selector).addEventListener(selector==='#leadSearch'?'input':'change',renderPipeline);
   $('#syncLeadFolders').onclick=()=>action($('#syncLeadFolders'),async()=>{const result=await api('/folders/sync',{key:activeLeadKey});await refresh(false);const lead=leads.find(l=>l.key===activeLeadKey);if(lead)populateLead(lead);const failed=result.results?.find(r=>!r.ok);toast(failed?failed.error:result.checked?'Telegram folders synced.':'Folders are up to date or waiting for Telegram to allow the next update.');});
+  $('#toggleAutoReplies').onclick=()=>action($('#toggleAutoReplies'),async()=>{const lead=leads.find(l=>l.key===activeLeadKey);await api('/auto-yes/update',{key:activeLeadKey,enabled:!lead.auto_yes.enabled});await refresh(false);populateLead(leads.find(l=>l.key===activeLeadKey));toast('Automatic reply setting updated.');});
   $('#refreshPipeline').onclick=()=>action($('#refreshPipeline'),()=>refresh(false));
   $$('[data-check-replies]').forEach(b=>b.onclick=()=>action(b,()=>checkReplyBatch()));
   $('#closeLeadDialog').onclick=()=>{if(!busy)$('#leadDialog').close()};$('#leadDialog').addEventListener('cancel',e=>{if(busy)e.preventDefault()});

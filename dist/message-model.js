@@ -1,6 +1,10 @@
 (function(root){
   const introduction="Hey @username! Hope you're doing well.\n\nI'm Mark from Wallstreet Market Maker (WMM).\n\nI recently came across $TOKEN and thought it would be worth connecting.\n\nWe work with crypto projects to improve trading liquidity, maintain healthier order books, and manage liquidity across exchanges.\n\nI believe there could be a good opportunity for us to work together.\n\nAre you the right person to discuss this with?";
   const followup="Hey, just following up on my previous message. Is improving liquidity and order-book depth something your team is currently exploring?\nHappy to share how WMM could help. If someone else handles this, could you point me their way?";
+  const exchanges={"bingx": "BingX", "bitget": "Bitget", "bitunix": "Bitunix", "blofin": "BloFin", "gateio": "Gate.io", "htx": "HTX", "lbank": "LBank", "lovelylegends": "Lovely Legends", "mexc": "MEXC", "okx": "OKX", "poloniex": "Poloniex", "toobit": "Toobit", "weex": "WEEX", "xt": "XT.com"};
+  const yesPitch="Nice to meet you @username,\nThis is mark from WMM\n\nI saw the @TOKEN chart on {{exchange}}, candlesticks look broken, we provide a professional trading team for market making, {{exchange}} trading fees are quite high but we make it good in the same daily fee spending budget\n\nWe make the chart most compatible with trading views and other trading signals tools to activate more real traders.";
+  const yesDemo="We can give you a free demo also\nIf you have time we can jump on call and discuss further";
+  const noReply="We can also offer a free demo so you can see how we work before making a decision. Would you be open to a quick call to discuss what could work for your project?";
   function type(contact){return contact.kind||'dm'}
   function timestamp(value){const n=Date.parse(value);return Number.isFinite(n)?n:0}
   function latestFirst(rows,getTime=row=>row.at){return rows.slice().sort((a,b)=>timestamp(getTime(b))-timestamp(getTime(a)))}
@@ -31,10 +35,10 @@
   function hasReplied(lead){return !!lead&&(lead.reply_status==='Replied'||lead.stage==='Replied'||!!lead.latest_reply||(lead.replies||[]).length>0)}
   function followupEligible(summary,lead){return !!lead&&!hasReplied(lead)&&lead.kind==='dm'&&lead.stage!=='Client'&&summary.canFollowup}
   function normalizeToken(value){return String(value||'').trim().replace(/^\$+/,'')}
-  function requiresToken(text){return /\$TOKEN\b|\{\{token\}\}/.test(text||'')}
-  function personalize(text,contact,tokenSymbol=''){
+  function requiresToken(text){return /[$@]TOKEN\b|\{\{token\}\}/.test(text||'')}
+  function personalize(text,contact,tokenSymbol='',exchange=''){
     const symbol=normalizeToken(tokenSymbol),handle=contact.username?'@'+String(contact.username).replace(/^@+/,''):(contact.name||'there');
-    return String(text||'').replaceAll('@{{username}}',handle).replaceAll('{{username}}',handle).replaceAll('@username',handle).replaceAll('{{name}}',contact.name||'').replaceAll('{{role}}',contact.role||'').replaceAll('{{group}}',contact.group||'').replaceAll('{{token}}',symbol?'$'+symbol:'$TOKEN').replace(/\$TOKEN\b/g,symbol?'$'+symbol:'$TOKEN');
+    return String(text||'').replaceAll('@{{username}}',handle).replaceAll('{{username}}',handle).replaceAll('@username',handle).replaceAll('{{name}}',contact.name||'').replaceAll('{{role}}',contact.role||'').replaceAll('{{group}}',contact.group||'').replaceAll('{{token}}',symbol?'$'+symbol:'$TOKEN').replace(/[$@]TOKEN\b/g,symbol?'$'+symbol:'$TOKEN').replaceAll('{{exchange}}',exchanges[exchange]||exchange||'{{exchange}}');
   }
   function status(summary){const d=summary.latest;if(!d)return 'Not sent';if(d.status==='Sending')return 'Sending';if(d.status==='Uncertain')return 'Delivery needs review';if(d.followup_of)return d.status==='Sent'?'Follow-up sent':'Follow-up '+d.status.toLowerCase();return d.status==='Sent'?'Message sent':d.status}
   function deliveryStates(summary){
@@ -44,5 +48,5 @@
     }
     return {message:state(false),followup:state(true)};
   }
-  root.WMMMessageModel={type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken,latestFirst,latestContacts,latestAccounts,hasReplied,followupEligible};
+  root.WMMMessageModel={exchanges,yesPitch,yesDemo,noReply,type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken,latestFirst,latestContacts,latestAccounts,hasReplied,followupEligible};
 })(typeof window==='undefined'?globalThis:window);
