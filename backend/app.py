@@ -691,7 +691,9 @@ class ResetQuota(Account):
     request_id:str=Field(min_length=8,max_length=128)
 class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
-async def health():return {'service':'teamradar','ok':True,'version':'3.6'}
+async def health():
+    from fastapi.responses import JSONResponse
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.6'},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
