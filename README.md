@@ -31,7 +31,7 @@ Google setup and trigger instructions are in `backend/README.md` and in the app'
 
 ## Files
 
-- `dist/index.html`: responsive dashboard, clearly labeled fictional sample data until connected.
+- `dist/index.html`: responsive dashboard with three real account slots and an empty directory until connected.
 - `backend/app.py`: authenticated API, Telegram session, discovery, settings, delivery records and Sheets integration.
 - `backend/sheet-trigger.gs`: installable Google Sheets On edit handler.
 - `render.yaml`: Render service blueprint.
@@ -58,3 +58,7 @@ The optional **Leave group after successful scan** checkbox is off by default. W
 ## Manual daily-limit reset
 
 Each account card has **Reset limits**. Choose DMs, group messages, or both in the confirmation dialog. The authenticated backend requires that account to be logged in and moves its quota baseline to the current delivery ledger position. Limits remain 15 DMs / 30 group attempts, with restored remaining allowance since the manual reset. The daily target also reflects confirmed sends since the applicable reset. Other accounts and unselected message types are unchanged. Midnight IST resets still apply. Resets are stored in an audit table and shown in Activity; delivery history, cross-account duplicate protection and Telegram-imposed pauses are never erased. Repeated requests with the same request ID are idempotent. A persistent DATA_DIR and one application worker are still required.
+
+## Live workspace display
+
+The dashboard contains no sample contacts or demo labels. Three real account slots are available; each shows Not connected until Telegram login succeeds. Only the connected gateway supplies contacts, delivery history and usage. Offline counters are marked unavailable, and messaging requires an authorized selected account.

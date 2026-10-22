@@ -1,6 +1,6 @@
 # TeamRadar Telegram gateway
 
-This service connects the private hosted dashboard to your own Telegram user account. The hosted dashboard alone cannot join groups, scan admins, write Sheets or send messages. It requires this persistent Python service, Telegram credentials and phone verification. No account or Google connection is included in the demo.
+This service connects the private hosted dashboard to your own Telegram user account. The hosted dashboard alone cannot join groups, scan admins, write Sheets or send messages. It requires this persistent Python service, Telegram credentials and phone verification. Telegram and Google connections require your own credentials.
 
 1. Create your API ID and API hash at https://my.telegram.org (not a BotFather token).
 2. Deploy the repository as a Python web service on Render or a VPS. Install `pip install -r backend/requirements.txt`. Start `python -m uvicorn backend.app:app --host 0.0.0.0 --port ${PORT:-8000}`. Use a single worker/instance.
