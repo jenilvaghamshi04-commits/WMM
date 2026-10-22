@@ -38,3 +38,15 @@ Google setup and trigger instructions are in `backend/README.md` and in the app'
 - `.env.example`: environment variable names with placeholders only.
 
 Secrets and Telegram sessions remain on your own service's private disk. API Hash is never returned by status endpoints, exported or committed. A bot token alone cannot log in as your user account. Telegram privacy, user messaging restrictions and FloodWait limits still apply. Live Telegram and Sheets integration requires your credentials and hosting connection; it is not connected by this repository upload.
+
+## Three-account messaging (v2)
+
+- Connections has three account slots. Choose a slot, save its API ID/hash, request a code for its phone, verify, and repeat for the other two. Each Telegram identity has its own session and usage ledger. Account 1 preserves the previous single-account session and confirmed delivery records.
+- Compose provides a sender selector and a DM / Group chat selector. Scan with the selected sender to discover team members and group destinations. Group messaging accepts group chats, not broadcast channels. Sender choice is explicit; the app does not switch accounts when a limit or Telegram restriction is reached.
+- Type your message, select recipients, and click **Send message**. This button sends the current text without requiring Save first. Save message sets the template and default sender for Sheet checkbox sends. App checkbox sends use the current selected sender and saved template.
+- Each actual Telegram identity has a daily goal of 10 confirmed messages (DMs plus group messages), a hard cap of 15 DM attempts and a separate hard cap of 30 group attempts. The target is a progress indicator; no unattended daily sending is scheduled.
+- Caps apply server-side to all app and Sheet send paths. Every dispatched attempt counts, including failed and uncertain delivery. Counters reset at midnight Asia/Kolkata. Reconnecting or using another slot for the same identity does not reset usage. Logging the same identity into two active slots is blocked.
+- Quotas are application limits, not a guarantee that Telegram will permit that many messages. Telegram restrictions stop sending; there is no automatic fallback to another account. Successful DMs are deduplicated across all senders and groups. Identical group messages are deduplicated per destination/day. Restarted in-flight messages are marked Uncertain and require review.
+- Activity and CSV exports show the sender slot. Keep DATA_DIR on a persistent disk: losing the database loses counters, duplicate history and sessions. Use a single application instance/worker; this SQLite version is not for horizontally scaled deployment.
+
+Validation: `python -W ignore -m unittest discover -s tests -q` covers three slots, sender routing, both caps, concurrent requests, date rollover, restart persistence, legacy migration, duplicate identities, Telegram pauses and Sheet sending.

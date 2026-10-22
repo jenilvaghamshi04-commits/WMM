@@ -1,54 +1,119 @@
-import asyncio,importlib.util,os,tempfile,unittest
+import asyncio,importlib.util,os,tempfile,unittest,sqlite3,json
+from types import SimpleNamespace
 from unittest.mock import patch
 from fastapi import HTTPException
+from telethon import errors
+
+class FakeClient:
+    def __init__(self,*args,user=101,authorized=True,**kwargs):self.user=user;self.authorized=authorized;self.sent=[];self.fail=None
+    async def connect(self):pass
+    async def disconnect(self):pass
+    def is_connected(self):return True
+    async def is_user_authorized(self):return self.authorized
+    async def get_me(self):return SimpleNamespace(id=self.user,first_name='Sender',last_name=str(self.user),phone='919999999999')
+    async def get_input_entity(self,uid):return uid
+    async def get_entity(self,target):return SimpleNamespace(id=target,megagroup=True)
+    async def send_message(self,peer,text):
+        if self.fail:raise self.fail
+        self.sent.append((peer,text))
+    async def send_code_request(self,phone):return SimpleNamespace(phone_code_hash='hash-'+phone)
+    async def sign_in(self,*args,**kwargs):self.authorized=True
+    async def log_out(self):self.authorized=False
 
 class GatewayTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory()
-        self.env=patch.dict(os.environ,{'DATA_DIR':self.tmp.name,'DASHBOARD_KEY':'test-secret','TELEGRAM_API_ID':'','TELEGRAM_API_HASH':''})
-        self.env.start()
-        spec=importlib.util.spec_from_file_location('gateway_under_test','backend/app.py')
-        self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app)
-    def tearDown(self):
-        self.app.db.close();self.env.stop();self.tmp.cleanup()
+        self.tmp=tempfile.TemporaryDirectory();self.env=patch.dict(os.environ,{'DATA_DIR':self.tmp.name,'DASHBOARD_KEY':'test-secret','TELEGRAM_API_ID':'','TELEGRAM_API_HASH':''});self.env.start();self.load()
+    def load(self):
+        spec=importlib.util.spec_from_file_location('gateway_under_test','backend/app.py');self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app)
+    def tearDown(self):self.app.db.close();self.env.stop();self.tmp.cleanup()
     def run_async(self,coro):return asyncio.run(coro)
-    def test_status_without_api_does_not_expose_credentials(self):
-        d=self.run_async(self.app.status())
-        self.assertFalse(d['api_configured']);self.assertFalse(d['authorized'])
-        self.assertNotIn('api_hash',d)
-    def test_api_required_and_auth(self):
-        with self.assertRaises(HTTPException) as e:self.app.require_client()
-        self.assertEqual(e.exception.status_code,409)
+    def sender(self,slot=1,user=None):
+        c=FakeClient(user=user or slot+100);self.app.clients[slot]=c;return c
+    def contact(self,n,kind='dm'):
+        c={'id':f'{kind}:{n}','user_id':str(n),'name':f'Person {n}','role':'CTO','group':'Group','kind':kind,'username':'','group_id':str(-1000000-n)};self.app.save(c);return c['id']
+    def setup_template(self):self.run_async(self.app.config(self.app.Config(template='Hello {{name}} in {{group}}')))
+    def test_three_empty_slots_no_secrets(self):
+        d=self.run_async(self.app.status());self.assertEqual(len(d['accounts']),3);self.assertFalse(d['authorized']);self.assertNotIn('api_hash',json.dumps(d));self.assertEqual(d['quota_timezone'],'Asia/Kolkata')
+    def test_auth_and_missing_account(self):
         with self.assertRaises(HTTPException):self.app.auth('Bearer wrong')
         self.app.auth('Bearer test-secret')
-    def test_api_hash_validation(self):
-        with self.assertRaises(HTTPException) as e:self.run_async(self.app.configure_telegram_api(self.app.TelegramAPI(api_id=12345,api_hash='bad')))
-        self.assertEqual(e.exception.status_code,400)
-    def test_api_can_be_added_without_environment_credentials(self):
-        class FakeClient:
-            def __init__(self,*args,**kwargs):pass
-            async def connect(self):pass
-            async def disconnect(self):pass
-            async def is_user_authorized(self):return False
-        with patch.object(self.app,'TelegramClient',FakeClient):
-            d=self.run_async(self.app.configure_telegram_api(self.app.TelegramAPI(api_id=12345,api_hash='a'*32)))
-        self.assertTrue(d['api_configured'])
-        self.assertEqual(self.app.db.execute('select api_id from telegram_api').fetchone()[0],12345)
-        self.assertNotIn('api_hash',self.run_async(self.app.status()))
-    def test_doc_rejected(self):
+        with self.assertRaises(HTTPException):self.app.require_client(2)
+    def test_separate_api_credentials(self):
+        async def run():
+            with patch.object(self.app,'TelegramClient',lambda *a,**k:FakeClient(authorized=False)):
+                for slot in (1,2,3):await self.app.configure_telegram_api(self.app.TelegramAPI(account_id=slot,api_id=slot,api_hash=str(slot)*32))
+            self.assertEqual(len(self.app.clients),3);self.assertEqual(self.app.db.execute('select count(*) from telegram_api').fetchone()[0],3)
+            self.assertNotIn('api_hash',json.dumps(await self.app.status()))
+        self.run_async(run())
+    def test_invalid_hash_and_document(self):
+        with self.assertRaises(HTTPException):self.run_async(self.app.configure_telegram_api(self.app.TelegramAPI(api_id=1,api_hash='bad')))
         with self.assertRaises(HTTPException):self.run_async(self.app.config(self.app.Config(sheet_url='https://docs.google.com/document/d/test')))
-    def test_delivery_substitution_and_duplicate_block(self):
-        class FakeClient:
-            calls=0
-            async def get_input_entity(self,uid):return uid
-            async def send_message(self,uid,msg):
-                if msg!='Hello Test in Group':raise AssertionError(msg)
-                self.calls+=1
-        fake=FakeClient();self.app.client=fake
-        self.run_async(self.app.config(self.app.Config(template='Hello {{name}} in {{group}}')))
-        self.app.save({'id':'1:2','user_id':'2','name':'Test','role':'CTO','group':'Group'})
-        self.assertEqual(self.run_async(self.app.deliver('1:2'))['status'],'Sent')
-        with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver('1:2'))
-        self.assertEqual(e.exception.status_code,409);self.assertEqual(fake.calls,1)
+    def test_selected_sender_and_direct_compose_message(self):
+        a=self.sender(1);b=self.sender(2);cid=self.contact(1)
+        result=self.run_async(self.app.send(self.app.Send(id=cid,account_id=2,message='Hi {{name}}')))
+        self.assertEqual(result['account_id'],2);self.assertEqual(a.sent,[]);self.assertEqual(b.sent[0][1],'Hi Person 1');self.assertEqual(self.app.records()[0]['account_id'],2)
+    def test_dm_limit_and_independent_account_quota(self):
+        self.sender(1);self.sender(2);self.setup_template()
+        async def run():
+            for n in range(15):await self.app.deliver(self.contact(n),1)
+            with self.assertRaises(HTTPException) as e:await self.app.deliver(self.contact(100),1)
+            self.assertEqual(e.exception.status_code,429)
+            await self.app.deliver(self.contact(101),2)
+            self.assertEqual(self.app.usage('101')['dm']['used'],15);self.assertEqual(self.app.usage('102')['dm']['used'],1)
+        self.run_async(run())
+    def test_group_limit_is_separate_from_dms(self):
+        self.sender();self.setup_template()
+        async def run():
+            for n in range(30):await self.app.deliver(self.contact(n,'group'),1,'group')
+            with self.assertRaises(HTTPException) as e:await self.app.deliver(self.contact(99,'group'),1,'group')
+            self.assertEqual(e.exception.status_code,429)
+            await self.app.deliver(self.contact(100),1)
+            self.assertEqual(self.app.usage('101')['group']['used'],30)
+        self.run_async(run())
+    def test_duplicate_blocked_across_accounts_and_groups(self):
+        self.sender(1);self.sender(2);self.setup_template();cid=self.contact(1)
+        async def run():
+            await self.app.deliver(cid,1)
+            self.app.save({'id':'differentgroup:1','user_id':'1','name':'Same person','role':'Admin','group':'Another group'})
+            with self.assertRaises(HTTPException) as e:await self.app.deliver('differentgroup:1',2)
+            self.assertEqual(e.exception.status_code,409)
+        self.run_async(run())
+    def test_telegram_identity_cannot_occupy_two_slots(self):
+        self.sender(1,user=123);c=self.sender(2,user=123)
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.identify(2,c))
+        self.assertEqual(e.exception.status_code,409)
+    def test_concurrent_requests_respect_cap(self):
+        c=self.sender();self.setup_template();ids=[self.contact(n) for n in range(20)]
+        async def run():
+            results=await asyncio.gather(*(self.app.deliver(cid,1) for cid in ids),return_exceptions=True)
+            self.assertEqual(sum(isinstance(r,dict) for r in results),15);self.assertEqual(len(c.sent),15)
+        self.run_async(run())
+    def test_restart_retains_usage_and_relogin_cannot_reset(self):
+        self.sender(user=555);self.setup_template();self.run_async(self.app.deliver(self.contact(1)));self.app.db.close();self.load();self.sender(3,user=555)
+        self.run_async(self.app.identify(3,self.app.clients[3]));self.assertEqual(self.app.usage('555')['dm']['used'],1)
+    def test_day_reset(self):
+        self.sender();self.setup_template()
+        with patch.object(self.app,'today',return_value='2026-10-22'):self.run_async(self.app.deliver(self.contact(1)))
+        with patch.object(self.app,'today',return_value='2026-10-23'):self.assertEqual(self.app.usage('101')['dm']['used'],0)
+    def test_uncertain_delivery_consumes_quota_and_blocks_retry(self):
+        c=self.sender();c.fail=RuntimeError('network timeout');self.setup_template();cid=self.contact(1)
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver(cid))
+        self.assertEqual(e.exception.status_code,502);self.assertEqual(self.app.usage('101')['dm']['used'],1)
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver(cid))
+        self.assertEqual(e.exception.status_code,409)
+    def test_flood_wait_pauses_account_without_sender_switch(self):
+        c=self.sender();other=self.sender(2);c.fail=errors.FloodWaitError(request=None,capture=120);self.setup_template()
+        with self.assertRaises(errors.FloodWaitError):self.run_async(self.app.deliver(self.contact(1)))
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver(self.contact(2)))
+        self.assertEqual(e.exception.status_code,429);self.assertEqual(other.sent,[])
+    def test_sheet_sender_uses_saved_account(self):
+        a=self.sender(1);b=self.sender(3);cid=self.contact(1)
+        self.run_async(self.app.config(self.app.Config(template='Hi {{name}}',sender_account=3)))
+        self.run_async(self.app.sheet_send(self.app.SheetSend(id=cid)))
+        self.assertEqual(len(a.sent),0);self.assertEqual(len(b.sent),1)
+    def test_legacy_delivery_migrates_without_resend(self):
+        self.app.db.execute('delete from meta');self.app.db.execute('insert into deliveries values(?,?,?,?)',('old:1','Sent',self.app.stamp(),''));self.app.save({'id':'old:1','user_id':'1','name':'Old','role':'Admin','group':'Old'});self.app.db.commit();self.app.db.close();self.load();self.sender();self.setup_template()
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver('old:1'))
+        self.assertEqual(e.exception.status_code,409)
 
 if __name__=='__main__':unittest.main()

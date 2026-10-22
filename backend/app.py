@@ -1,107 +1,179 @@
-import os,json,sqlite3,asyncio,secrets,re
-from datetime import datetime,timezone
+import os,json,sqlite3,asyncio,secrets,re,hashlib,uuid
+from datetime import datetime,timezone,timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
+from typing import Literal
 from fastapi import FastAPI,Depends,Header,HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel,SecretStr,Field
-from telethon import TelegramClient,functions,types,errors
+from telethon import TelegramClient,functions,types,errors,utils
 
-ROOT=Path(os.getenv('DATA_DIR','./data')); ROOT.mkdir(parents=True,exist_ok=True); os.chmod(ROOT,0o700)
+ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True);os.chmod(ROOT,0o700)
 KEY=os.environ['DASHBOARD_KEY']
-API_ID=os.getenv('TELEGRAM_API_ID'); API_HASH=os.getenv('TELEGRAM_API_HASH')
-app=FastAPI(title='TeamRadar gateway')
+API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
+TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
+app=FastAPI(title='WMM TeamRadar',version='2.0')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
-client=None
-lock=asyncio.Lock(); phone_hash={}
+lock=asyncio.Lock();phone_hash={};clients={};startup_errors={}
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
 db.execute('create table if not exists contacts(id text primary key, data text)')
 db.execute('create table if not exists settings(id integer primary key, data text)')
 db.execute('create table if not exists telegram_api(id integer primary key, api_id integer, api_hash text)')
-db.execute('create table if not exists deliveries(id text primary key, status text, at text, error text)');db.commit()
-
-def make_client():
-    row=db.execute('select api_id,api_hash from telegram_api where id=1').fetchone()
-    api_id,api_hash=row if row else (API_ID,API_HASH)
-    return TelegramClient(str(ROOT/'telegram'),int(api_id),api_hash,flood_sleep_threshold=0) if api_id and api_hash else None
-
-client=make_client()
-def require_client():
-    if client is None:raise HTTPException(409,'Save your Telegram API ID and API Hash in Connections first')
+db.execute('create table if not exists deliveries(id text primary key, status text, at text, error text)')
+db.execute('create table if not exists account_info(slot integer primary key, principal text, label text, phone text, blocked_until text)')
+db.execute('create table if not exists outbox(id text primary key, principal text, slot integer, kind text, target text, contact_id text, status text, day text, at text, error text, message_hash text)')
+db.execute('create table if not exists meta(key text primary key, value text)')
+# Preserve confirmed legacy deliveries when upgrading from the single-account version.
+if not db.execute("select 1 from meta where key='outbox_migrated'").fetchone():
+    for cid,status,at,error in db.execute('select * from deliveries').fetchall():
+        c=db.execute('select data from contacts where id=?',(cid,)).fetchone()
+        target=json.loads(c[0]).get('user_id',cid) if c else cid
+        try:day=datetime.fromisoformat(at).astimezone(TZ).date().isoformat()
+        except ValueError:day=datetime.now(TZ).date().isoformat()
+        db.execute('insert into outbox values(?,?,?,?,?,?,?,?,?,?,?)',('legacy:'+cid,'slot:1',1,'dm',str(target),cid,status,day,at,error,''))
+    db.execute("insert into meta values('outbox_migrated','1')")
+# A process may have stopped after Telegram accepted a message. Never resend blindly.
+db.execute("update outbox set status='Uncertain',error='Server restarted during delivery; check Telegram' where status='Sending'");db.commit()
 
 def auth(authorization:str=Header(default='')):
-    if not secrets.compare_digest(authorization,'Bearer '+KEY): raise HTTPException(401,'Invalid dashboard key')
-
-def settings():
-    row=db.execute('select data from settings where id=1').fetchone();return json.loads(row[0]) if row else {'template':'','sheet_url':''}
-def contacts(): return [json.loads(r[0]) for r in db.execute('select data from contacts')]
-def save(c): db.execute('insert or replace into contacts values(?,?)',(c['id'],json.dumps(c)));db.commit()
+    if not secrets.compare_digest(authorization,'Bearer '+KEY):raise HTTPException(401,'Invalid dashboard key')
 def stamp():return datetime.now(timezone.utc).isoformat()
+def today():return datetime.now(TZ).date().isoformat()
+def settings():
+    r=db.execute('select data from settings where id=1').fetchone()
+    return {'template':'','sheet_url':'','sender_account':1,**(json.loads(r[0]) if r else {})}
+def contacts():return [json.loads(r[0]) for r in db.execute('select data from contacts')]
+def save(c):db.execute('insert or replace into contacts values(?,?)',(c['id'],json.dumps(c)));db.commit()
+def session_path(slot):return str(ROOT/('telegram' if slot==1 else f'telegram_{slot}'))
+def make_client(slot):
+    r=db.execute('select api_id,api_hash from telegram_api where id=?',(slot,)).fetchone()
+    api_id,api_hash=r if r else ((API_ID,API_HASH) if slot==1 else (None,None))
+    return TelegramClient(session_path(slot),int(api_id),api_hash,flood_sleep_threshold=0) if api_id and api_hash else None
+def require_client(slot):
+    c=clients.get(slot)
+    if c is None:raise HTTPException(409,f'Configure the API for Account {slot} in Connections first')
+    return c
+async def ready(slot):
+    c=require_client(slot)
+    if not c.is_connected():await c.connect()
+    if not await c.is_user_authorized():raise HTTPException(409,f'Log in to Account {slot} first')
+    return c
+async def identify(slot,c):
+    me=await c.get_me();principal=str(me.id)
+    # One Telegram identity cannot consume three independent sets of limits.
+    for other in (1,2,3):
+        if other==slot:continue
+        oc=clients.get(other)
+        if oc and oc.is_connected() and await oc.is_user_authorized():
+            om=await oc.get_me()
+            if om.id==me.id:raise HTTPException(409,f'This Telegram account is already logged in as Account {other}')
+    label=' '.join(filter(None,[getattr(me,'first_name',''),getattr(me,'last_name','')])) or f'Account {slot}'
+    phone=getattr(me,'phone','') or ''
+    old=db.execute('select blocked_until from account_info where principal=? order by blocked_until desc limit 1',(principal,)).fetchone()
+    db.execute('insert or replace into account_info values(?,?,?,?,?)',(slot,principal,label,('••••'+phone[-4:]) if phone else '',old[0] if old else ''))
+    db.execute('update outbox set principal=? where principal=?',(principal,f'slot:{slot}'));db.commit()
+    return principal
+
+def usage(principal):
+    rows=db.execute('select kind,count(*) from outbox where principal=? and day=? group by kind',(principal,today())).fetchall()
+    counts=dict(rows)
+    return {k:{'used':counts.get(k,0),'limit':v,'remaining':max(0,v-counts.get(k,0))} for k,v in LIMITS.items()}
+def records():
+    keys=['delivery_id','principal','account_id','kind','target','id','status','day','at','error','message_hash']
+    return [dict(zip(keys,r)) for r in db.execute('select * from outbox order by at desc')]
 @app.on_event('startup')
 async def start():
-    if client:await client.connect()
+    for slot in (1,2,3):
+        try:
+            c=make_client(slot)
+            if c:clients[slot]=c;await c.connect()
+        except Exception:startup_errors[slot]='Telegram connection unavailable. Reconnect this account in Connections.'
 @app.on_event('shutdown')
 async def stop():
-    if client:await client.disconnect()
+    for c in clients.values():await c.disconnect()
 @app.exception_handler(errors.FloodWaitError)
 async def flood(request,exc):
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=429,content={'detail':f'Telegram requires a {exc.seconds} second wait. Try later; no automatic retry.'})
-class Login(BaseModel): phone:str
-class Verify(BaseModel): phone:str; code:str=''; password:str=''
-class Scan(BaseModel): link:str; join:bool=False
-class Config(BaseModel): template:str=''; sheet_url:str=''
-class Send(BaseModel): id:str
-class TelegramAPI(BaseModel):
-    api_id:int=Field(gt=0)
-    api_hash:SecretStr
-
+    return JSONResponse(status_code=429,content={'detail':f'Telegram requires a {exc.seconds} second wait. Sending stopped; no automatic retry or sender switch.'})
+@app.exception_handler(errors.RPCError)
+async def rpc_error(request,exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=400,content={'detail':str(exc)})
+class Account(BaseModel):account_id:int=Field(default=1,ge=1,le=3)
+class Login(Account):phone:str
+class Verify(Account):phone:str;code:str='';password:str=''
+class Scan(Account):link:str;join:bool=False
+class Config(BaseModel):template:str='';sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3)
+class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None
+class SheetSend(BaseModel):id:str
+class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
-async def health():return {'service':'teamradar','ok':True}
-
+async def health():return {'service':'teamradar','ok':True,'version':'2.0'}
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
-    global client
-    value=body.api_hash.get_secret_value().strip()
+    slot=body.account_id;value=body.api_hash.get_secret_value().strip()
     if not re.fullmatch(r'[a-fA-F0-9]{32}',value):raise HTTPException(400,'API Hash must contain 32 hexadecimal characters from my.telegram.org')
     async with lock:
-        if client and await client.is_user_authorized():raise HTTPException(409,'Disconnect your Telegram session before replacing API credentials')
-        candidate=TelegramClient(str(ROOT/'telegram'),body.api_id,value,flood_sleep_threshold=0)
-        if client:await client.disconnect()
+        old=clients.get(slot)
+        if old and old.is_connected() and await old.is_user_authorized():raise HTTPException(409,'Disconnect this Telegram account before replacing its API credentials')
+        if old:await old.disconnect()
+        candidate=TelegramClient(session_path(slot),body.api_id,value,flood_sleep_threshold=0)
         try:await candidate.connect()
         except Exception:
             await candidate.disconnect()
-            if client:await client.connect()
             raise HTTPException(502,'Could not reach Telegram. API settings were not saved; try again later.')
-        db.execute('insert or replace into telegram_api values(1,?,?)',(body.api_id,value));db.commit()
-        client=candidate
-    return {'api_configured':True}
-
+        db.execute('insert or replace into telegram_api values(?,?,?)',(slot,body.api_id,value));db.commit()
+        clients[slot]=candidate;startup_errors.pop(slot,None)
+    return {'api_configured':True,'account_id':slot}
 @app.get('/status',dependencies=[Depends(auth)])
-async def status(): return {'api_configured':client is not None,'authorized':await client.is_user_authorized() if client else False,'contacts':contacts(),'settings':settings(),'deliveries':[dict(zip(['id','status','at','error'],r)) for r in db.execute('select * from deliveries')]}
+async def status():
+    accounts=[]
+    for slot in (1,2,3):
+        c=clients.get(slot);authorized=False
+        try:authorized=bool(c and c.is_connected() and await c.is_user_authorized())
+        except Exception:pass
+        row=db.execute('select principal,label,phone,blocked_until from account_info where slot=?',(slot,)).fetchone()
+        principal,label,phone,blocked=row if row else (f'slot:{slot}',f'Account {slot}','','')
+        if authorized and not row:
+            try:principal=await identify(slot,c)
+            except HTTPException:authorized=False
+            row=db.execute('select principal,label,phone,blocked_until from account_info where slot=?',(slot,)).fetchone()
+            if row:principal,label,phone,blocked=row
+        u=usage(principal)
+        sent=db.execute("select count(*) from outbox where principal=? and day=? and status='Sent'",(principal,today())).fetchone()[0]
+        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,'')})
+    return {'version':'2.0','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records()}
 @app.post('/login',dependencies=[Depends(auth)])
 async def login(body:Login):
-    require_client()
     async with lock:
-        r=await client.send_code_request(body.phone);phone_hash[body.phone]=r.phone_code_hash
-    return {'ok':True}
+        c=require_client(body.account_id)
+        if not c.is_connected():await c.connect()
+        r=await c.send_code_request(body.phone);phone_hash[(body.account_id,body.phone)]=r.phone_code_hash
+    return {'ok':True,'account_id':body.account_id}
 @app.post('/verify',dependencies=[Depends(auth)])
 async def verify(body:Verify):
-    require_client()
     async with lock:
+        c=require_client(body.account_id)
+        if not c.is_connected():await c.connect()
         try:
-            if body.password: await client.sign_in(password=body.password)
-            else: await client.sign_in(body.phone,body.code,phone_code_hash=phone_hash.get(body.phone))
+            if body.password:await c.sign_in(password=body.password)
+            else:await c.sign_in(body.phone,body.code,phone_code_hash=phone_hash.get((body.account_id,body.phone)))
         except errors.SessionPasswordNeededError:return {'password_required':True}
-    return {'authorized':True}
+        try:await identify(body.account_id,c)
+        except HTTPException:
+            await c.log_out();raise
+    return {'authorized':True,'account_id':body.account_id}
 @app.post('/logout',dependencies=[Depends(auth)])
-async def logout():
-    require_client()
-    async with lock: await client.log_out();await client.connect()
+async def logout(body:Account):
+    async with lock:
+        c=require_client(body.account_id);await c.log_out()
+        clients.pop(body.account_id,None)
+        replacement=make_client(body.account_id)
+        if replacement:clients[body.account_id]=replacement;await replacement.connect()
     return {'ok':True}
 @app.post('/scan',dependencies=[Depends(auth)])
 async def scan(body:Scan):
-    require_client()
-    if not await client.is_user_authorized():raise HTTPException(409,'Connect your Telegram account first')
+    client=await ready(body.account_id)
     link=body.link.strip().replace('https://t.me/','').replace('http://t.me/','').strip('/')
     if not link or '/' in link and not link.startswith('joinchat/'):raise HTTPException(400,'Use a group username or invite link, not a post link')
     async with lock:
@@ -130,8 +202,10 @@ async def scan(body:Scan):
                 if u.bot or u.deleted:continue
                 rank=getattr(p,'rank',None) or ''
                 owner=isinstance(p,(types.ChannelParticipantCreator,types.ChatParticipantCreator))
-                c={'id':str(entity.id)+':'+str(u.id),'user_id':str(u.id),'name':(' '.join(filter(None,[u.first_name,u.last_name])) or 'Unnamed admin'),'username':u.username or '', 'group':entity.title,'link':body.link,'role':'Owner' if owner else (rank or 'Admin'),'title':rank,'source':'Telegram admin title' if rank else 'Telegram permissions','scanned_at':stamp(),'status':'Ready'}
+                c={'id':str(entity.id)+':'+str(u.id),'user_id':str(u.id),'name':(' '.join(filter(None,[u.first_name,u.last_name])) or 'Unnamed admin'),'username':u.username or '', 'group':entity.title,'link':body.link,'role':'Owner' if owner else (rank or 'Admin'),'title':rank,'source':'Telegram admin title' if rank else 'Telegram permissions','scanned_at':stamp(),'status':'Ready','scan_account':body.account_id,'group_id':str(utils.get_peer_id(entity))}
                 save(c);result.append(c)
+            group={'id':'group:'+str(utils.get_peer_id(entity)),'name':entity.title,'username':getattr(entity,'username','') or '', 'role':'Group chat','group':entity.title,'link':body.link,'group_id':str(utils.get_peer_id(entity)),'kind':'group','scan_account':body.account_id,'source':'Telegram group','scanned_at':stamp(),'status':'Ready'}
+            if getattr(entity,'megagroup',False) or isinstance(entity,types.Chat):save(group)
             return {'contacts':result,'group':entity.title,'count':len(result)}
         except errors.InviteRequestSentError:raise HTTPException(409,'Join request sent. Scan after an administrator approves it.')
         except errors.ChatAdminRequiredError:raise HTTPException(403,'Telegram hides this admin list from your account. Try its linked discussion group or ask for access.')
@@ -141,30 +215,55 @@ async def scan(body:Scan):
 async def config(body:Config):
     if body.sheet_url and 'docs.google.com/spreadsheets/d/' not in body.sheet_url:raise HTTPException(400,'Paste a Google Sheets URL, not a Google Doc')
     db.execute('insert or replace into settings values(1,?)',(body.model_dump_json(),));db.commit();return {'ok':True}
-async def deliver(cid):
-    require_client()
+async def deliver(cid,slot=1,kind='dm',message=None):
     async with lock:
+        c=await ready(slot);principal=await identify(slot,c)
         row=db.execute('select data from contacts where id=?',(cid,)).fetchone()
         if not row:raise HTTPException(404,'Contact not found')
-        previous=db.execute('select status from deliveries where id=?',(cid,)).fetchone()
-        if previous and previous[0] in ('Sent','Sending','Uncertain'):raise HTTPException(409,'Already sent or awaiting review. Duplicate blocked.')
-        template=settings()['template'].strip()
-        if not template:raise HTTPException(400,'Save your custom message first')
-        c=json.loads(row[0]);msg=template.replace('{{name}}',c['name']).replace('{{role}}',c['role']).replace('{{group}}',c['group'])
-        db.execute('insert or replace into deliveries values(?,?,?,?)',(cid,'Sending',stamp(),''));db.commit()
+        contact=json.loads(row[0])
+        if (kind=='group') != (contact.get('kind')=='group'):raise HTTPException(400,'Choose a group chat for group messages or a team member for DMs')
+        text=(message if message is not None else settings()['template']).strip()
+        if not text:raise HTTPException(400,'Write your message before sending')
+        text=text.replace('{{name}}',contact['name']).replace('{{role}}',contact['role']).replace('{{group}}',contact['group'])
+        digest=hashlib.sha256(text.encode()).hexdigest()
+        target=str(contact['group_id'] if kind=='group' else contact['user_id'])
+        date=today()
+        prior=db.execute("select 1 from outbox where kind=? and target=? and status in ('Sent','Sending','Uncertain')"+(" and day=? and message_hash=?" if kind=='group' else ''),([kind,target,date,digest] if kind=='group' else [kind,target])).fetchone()
+        if prior:raise HTTPException(409,'Already sent or awaiting review. Duplicate blocked across sender accounts.')
+        info=db.execute('select blocked_until from account_info where slot=?',(slot,)).fetchone()
+        if info and info[0] and info[0]>stamp():raise HTTPException(429,'This account is paused by Telegram until '+info[0])
+        u=usage(principal)[kind]
+        if u['remaining']<=0:raise HTTPException(429,f"Account {slot} reached today's {LIMITS[kind]} {'DM' if kind=='dm' else 'group message'} limit. Resets at midnight Asia/Kolkata.")
+        # Resolve the destination using this sender's own Telegram permissions before reserving a send.
         try:
-            await client.send_message(await client.get_input_entity(int(c['user_id'])),msg)
+            if kind=='group':peer=await c.get_entity(int(target))
+            elif contact.get('username'):
+                peer=await c.get_entity(contact['username'])
+                if str(peer.id)!=target:raise HTTPException(409,'Username now belongs to another user. Rescan this contact before sending.')
+            else:peer=await c.get_input_entity(int(target))
+        except (ValueError,TypeError):raise HTTPException(409,'This sender cannot resolve the recipient. Scan its group with this account first.')
+        if kind=='group' and not (isinstance(peer,types.Chat) or getattr(peer,'megagroup',False)):raise HTTPException(400,'The selected destination is not a group chat')
+        delivery_id=uuid.uuid4().hex
+        # Count every dispatched attempt, including failures and uncertain sends, toward the daily cap.
+        db.execute('insert into outbox values(?,?,?,?,?,?,?,?,?,?,?)',(delivery_id,principal,slot,kind,target,cid,'Sending',date,stamp(),'',digest));db.commit()
+        try:await c.send_message(peer,text)
         except errors.FloodWaitError as exc:
-            db.execute('update deliveries set status=?,error=? where id=?',('Failed',f'Wait {exc.seconds}s',cid));db.commit();raise
+            blocked=(datetime.now(timezone.utc)+timedelta(seconds=exc.seconds)).isoformat()
+            db.execute('update account_info set blocked_until=? where principal=?',(blocked,principal))
+            db.execute('update outbox set status=?,error=? where id=?',('Failed',f'Telegram wait: {exc.seconds}s',delivery_id));db.commit();raise
         except errors.RPCError as exc:
-            db.execute('update deliveries set status=?,error=? where id=?',('Failed',str(exc),cid));db.commit();raise HTTPException(400,str(exc))
+            if isinstance(exc,errors.PeerFloodError):
+                db.execute('update account_info set blocked_until=? where principal=?',((datetime.now(timezone.utc)+timedelta(days=1)).isoformat(),principal))
+            db.execute('update outbox set status=?,error=? where id=?',('Failed',str(exc),delivery_id));db.commit();raise
         except Exception:
-            db.execute('update deliveries set status=?,error=? where id=?',('Uncertain','Check Telegram before retrying',cid));db.commit();raise HTTPException(502,'Delivery uncertain; check Telegram before retrying')
-        db.execute('update deliveries set status=?,at=? where id=?',('Sent',stamp(),cid));db.commit();return {'status':'Sent','id':cid}
+            db.execute('update outbox set status=?,error=? where id=?',('Uncertain','Check Telegram before retrying',delivery_id));db.commit();raise HTTPException(502,'Delivery uncertain. Check Telegram before retrying.')
+        db.execute('update outbox set status=?,at=? where id=?',('Sent',stamp(),delivery_id));db.commit()
+        return {'status':'Sent','id':cid,'account_id':slot,'kind':kind,'usage':usage(principal)}
 @app.post('/send',dependencies=[Depends(auth)])
-async def send(body:Send):return await deliver(body.id)
+async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message)
 @app.post('/sheet-send',dependencies=[Depends(auth)])
-async def sheet_send(body:Send):return await deliver(body.id)
+async def sheet_send(body:SheetSend):
+    cfg=settings();return await deliver(body.id,cfg['sender_account'],'dm')
 def sync_sheet():
     import gspread
     cfg=settings()
@@ -177,7 +276,8 @@ def sync_sheet():
     existing=ws.get_all_values();checks={r[0]:r[6] for r in existing[1:] if len(r)>6}
     rows=[['Contact ID','Name','Username','Role / title','Group','Profile','Send message','Delivery status','Scanned at']]
     for c in contacts():
-        d=db.execute('select status from deliveries where id=?',(c['id'],)).fetchone()
+        if c.get('kind')=='group':continue
+        d=db.execute('select status from outbox where contact_id=? order by at desc limit 1',(c['id'],)).fetchone()
         rows.append([c['id'],c['name'],'@'+c['username'] if c['username'] else '',c['role'],c['group'],'https://t.me/'+c['username'] if c['username'] else '',checks.get(c['id'],'FALSE'),d[0] if d else 'Ready',c['scanned_at']])
     ws.clear();ws.update(values=rows,range_name='A1',value_input_option='RAW');ws.freeze(rows=1)
     if len(rows)>1:book.batch_update({'requests':[{'setDataValidation':{'range':{'sheetId':ws.id,'startRowIndex':1,'endRowIndex':len(rows),'startColumnIndex':6,'endColumnIndex':7},'rule':{'condition':{'type':'BOOLEAN'},'strict':True,'showCustomUi':True}}}]})
