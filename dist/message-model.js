@@ -28,6 +28,8 @@
     for(const d of history){const key=(d.kind||'dm')+':'+(d.target??d.id);if(!grouped.has(key))grouped.set(key,[]);grouped.get(key).push(d)}
     return latestFirst([...grouped.entries()].map(([key,rows])=>{const s=summarize(rows),activity=leadTimes.get(key);s.activity_at=timestamp(activity)>timestamp(s.latest.at)?activity:s.latest.at;return s}),s=>s.activity_at);
   }
+  function hasReplied(lead){return !!lead&&(lead.reply_status==='Replied'||lead.stage==='Replied'||!!lead.latest_reply||(lead.replies||[]).length>0)}
+  function followupEligible(summary,lead){return !!lead&&!hasReplied(lead)&&lead.kind==='dm'&&lead.stage!=='Client'&&summary.canFollowup}
   function normalizeToken(value){return String(value||'').trim().replace(/^\$+/,'')}
   function requiresToken(text){return /\$TOKEN\b|\{\{token\}\}/.test(text||'')}
   function personalize(text,contact,tokenSymbol=''){
@@ -42,5 +44,5 @@
     }
     return {message:state(false),followup:state(true)};
   }
-  root.WMMMessageModel={type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken,latestFirst,latestContacts,latestAccounts};
+  root.WMMMessageModel={type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken,latestFirst,latestContacts,latestAccounts,hasReplied,followupEligible};
 })(typeof window==='undefined'?globalThis:window);
