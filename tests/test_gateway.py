@@ -116,4 +116,57 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver('old:1'))
         self.assertEqual(e.exception.status_code,409)
 
+    def scan_client(self,slot=1,empty=False,scan_error=None,leave_error=None,basic=False):
+        from telethon import types,functions
+        app=self.app
+        entity=types.Chat(77,'Test group',types.ChatPhotoEmpty(),1,None,1) if basic else types.Channel(77,'Test group',types.ChatPhotoEmpty(),None,megagroup=True)
+        class Scanner(FakeClient):
+            def __init__(self):super().__init__(user=100+slot);self.requests=[]
+            async def get_entity(self,target):return entity
+            async def get_participants(self,*args,**kwargs):
+                if scan_error:raise scan_error
+                return [] if empty else [SimpleNamespace(id=10,first_name='Admin',last_name='',username='admin_test',bot=False,deleted=False,participant=SimpleNamespace(rank='CTO'))]
+            async def __call__(self,req):
+                self.requests.append(req)
+                if isinstance(req,functions.messages.GetFullChatRequest):
+                    return SimpleNamespace(users=[SimpleNamespace(id=10,first_name='Admin',last_name='',username='admin_test',bot=False,deleted=False)],full_chat=SimpleNamespace(participants=SimpleNamespace(participants=[types.ChatParticipantAdmin(10,1,None)])))
+                if isinstance(req,(functions.channels.LeaveChannelRequest,functions.messages.DeleteChatUserRequest)):
+                    assert app.db.execute("select 1 from contacts where id='77:10'").fetchone(),'leave happened before admin data was saved'
+                    if leave_error:raise leave_error
+                return SimpleNamespace()
+        client=Scanner();self.app.clients[slot]=client;return client
+    def test_leave_only_selected_account_after_committed_scan(self):
+        from telethon import functions
+        other=self.sender(1);c=self.scan_client(2)
+        r=self.run_async(self.app.scan(self.app.Scan(account_id=2,link='@test_group',leave_after_scan=True)))
+        self.assertEqual(r['leave']['status'],'left');self.assertEqual(r['count'],1)
+        self.assertTrue(any(isinstance(x,functions.channels.LeaveChannelRequest) for x in c.requests));self.assertEqual(other.sent,[])
+        group=next(p for p in self.app.contacts() if p.get('kind')=='group');self.assertEqual(group['membership']['2'],'left')
+        self.assertTrue(any(p['id']=='77:10' for p in self.app.contacts()))
+    def test_scan_failure_does_not_leave(self):
+        c=self.scan_client(scan_error=errors.ChatAdminRequiredError(request=None))
+        with self.assertRaises(HTTPException):self.run_async(self.app.scan(self.app.Scan(link='@test_group',leave_after_scan=True)))
+        self.assertEqual(c.requests,[])
+    def test_empty_scan_does_not_leave(self):
+        c=self.scan_client(empty=True);r=self.run_async(self.app.scan(self.app.Scan(link='@test_group',leave_after_scan=True)))
+        self.assertEqual(r['leave']['status'],'skipped');self.assertEqual(c.requests,[])
+    def test_default_scan_stays_in_group(self):
+        c=self.scan_client();r=self.run_async(self.app.scan(self.app.Scan(link='@test_group')))
+        self.assertEqual(r['leave']['status'],'not_requested');self.assertEqual(c.requests,[])
+    def test_leave_error_preserves_scan_results(self):
+        self.scan_client(leave_error=errors.ChatAdminRequiredError(request=None))
+        r=self.run_async(self.app.scan(self.app.Scan(link='@test_group',leave_after_scan=True)))
+        self.assertEqual(r['leave']['status'],'failed');self.assertEqual(r['count'],1)
+        self.assertTrue(any(p['id']=='77:10' for p in self.app.contacts()))
+    def test_basic_group_leaves_with_delete_chat_user(self):
+        from telethon import functions
+        c=self.scan_client(basic=True);r=self.run_async(self.app.scan(self.app.Scan(link='@test_group',leave_after_scan=True)))
+        self.assertEqual(r['leave']['status'],'left');self.assertTrue(any(isinstance(x,functions.messages.DeleteChatUserRequest) for x in c.requests))
+    def test_group_send_requires_rejoin_after_leaving(self):
+        self.scan_client();self.run_async(self.app.scan(self.app.Scan(link='@test_group',leave_after_scan=True)))
+        group=next(p for p in self.app.contacts() if p.get('kind')=='group');self.setup_template()
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver(group['id'],1,'group'))
+        self.assertEqual(e.exception.status_code,409);self.assertIn('Rejoin',e.exception.detail)
+
 if __name__=='__main__':unittest.main()
+

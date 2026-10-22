@@ -102,7 +102,7 @@ async def rpc_error(request,exc):
 class Account(BaseModel):account_id:int=Field(default=1,ge=1,le=3)
 class Login(Account):phone:str
 class Verify(Account):phone:str;code:str='';password:str=''
-class Scan(Account):link:str;join:bool=False
+class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False
 class Config(BaseModel):template:str='';sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3)
 class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None
 class SheetSend(BaseModel):id:str
@@ -205,8 +205,38 @@ async def scan(body:Scan):
                 c={'id':str(entity.id)+':'+str(u.id),'user_id':str(u.id),'name':(' '.join(filter(None,[u.first_name,u.last_name])) or 'Unnamed admin'),'username':u.username or '', 'group':entity.title,'link':body.link,'role':'Owner' if owner else (rank or 'Admin'),'title':rank,'source':'Telegram admin title' if rank else 'Telegram permissions','scanned_at':stamp(),'status':'Ready','scan_account':body.account_id,'group_id':str(utils.get_peer_id(entity))}
                 save(c);result.append(c)
             group={'id':'group:'+str(utils.get_peer_id(entity)),'name':entity.title,'username':getattr(entity,'username','') or '', 'role':'Group chat','group':entity.title,'link':body.link,'group_id':str(utils.get_peer_id(entity)),'kind':'group','scan_account':body.account_id,'source':'Telegram group','scanned_at':stamp(),'status':'Ready'}
-            if getattr(entity,'megagroup',False) or isinstance(entity,types.Chat):save(group)
-            return {'contacts':result,'group':entity.title,'count':len(result)}
+            stored=db.execute('select data from contacts where id=?',(group['id'],)).fetchone()
+            group['membership']=json.loads(stored[0]).get('membership',{}) if stored else {}
+            if body.join:group['membership'][str(body.account_id)]='member'
+            is_group=getattr(entity,'megagroup',False) or isinstance(entity,types.Chat)
+            if is_group:save(group)
+            leave={'requested':body.leave_after_scan,'status':'not_requested','error':''}
+            # All collected contacts and the group record have committed before any leave request.
+            if body.leave_after_scan:
+                if not result:
+                    leave['status']='skipped'
+                    leave['error']='No visible admin records collected; account remains in the group.'
+                else:
+                    try:
+                        if isinstance(entity,types.Channel):
+                            await client(functions.channels.LeaveChannelRequest(entity))
+                        elif isinstance(entity,types.Chat):
+                            await client(functions.messages.DeleteChatUserRequest(entity.id,types.InputUserSelf()))
+                        else:raise ValueError('Unsupported chat type')
+                        leave['status']='left'
+                    except errors.UserNotParticipantError:
+                        leave['status']='already_left'
+                    except errors.RPCError as exc:
+                        leave['status']='failed';leave['error']=str(exc)
+                    except Exception:
+                        leave['status']='uncertain';leave['error']='Could not confirm leaving. Check Telegram membership before retrying.'
+                    if leave['status'] in ('left','already_left'):
+                        group['membership'][str(body.account_id)]='left'
+                    elif leave['status']=='uncertain':
+                        group['membership'][str(body.account_id)]='unknown'
+                    group['last_leave']={**leave,'account_id':body.account_id,'at':stamp()}
+                    if is_group:save(group)
+            return {'contacts':result,'group':entity.title,'count':len(result),'leave':leave,'account_id':body.account_id}
         except errors.InviteRequestSentError:raise HTTPException(409,'Join request sent. Scan after an administrator approves it.')
         except errors.ChatAdminRequiredError:raise HTTPException(403,'Telegram hides this admin list from your account. Try its linked discussion group or ask for access.')
         except HTTPException:raise
@@ -222,6 +252,7 @@ async def deliver(cid,slot=1,kind='dm',message=None):
         if not row:raise HTTPException(404,'Contact not found')
         contact=json.loads(row[0])
         if (kind=='group') != (contact.get('kind')=='group'):raise HTTPException(400,'Choose a group chat for group messages or a team member for DMs')
+        if kind=='group' and contact.get('membership',{}).get(str(slot))=='left':raise HTTPException(409,f'Account {slot} left this group. Rejoin and rescan with Leave group after scan switched off before sending group messages.')
         text=(message if message is not None else settings()['template']).strip()
         if not text:raise HTTPException(400,'Write your message before sending')
         text=text.replace('{{name}}',contact['name']).replace('{{role}}',contact['role']).replace('{{group}}',contact['group'])

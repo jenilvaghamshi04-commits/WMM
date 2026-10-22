@@ -50,3 +50,7 @@ Secrets and Telegram sessions remain on your own service's private disk. API Has
 - Activity and CSV exports show the sender slot. Keep DATA_DIR on a persistent disk: losing the database loses counters, duplicate history and sessions. Use a single application instance/worker; this SQLite version is not for horizontally scaled deployment.
 
 Validation: `python -W ignore -m unittest discover -s tests -q` covers three slots, sender routing, both caps, concurrent requests, date rollover, restart persistence, legacy migration, duplicate identities, Telegram pauses and Sheet sending.
+
+## Leave after scan
+
+The optional **Leave group after successful scan** checkbox is off by default. When enabled, only the selected scanning account leaves, after at least one visible human admin record and the group record are saved. Failed scans and scans with zero collected admins do not leave. Leaving failures are returned separately from the successful scan, so saved records remain accessible. Both basic groups and supergroups/channels use their respective Telegram leave methods. Group messages from an account marked as left are blocked until it rejoins and scans with leaving switched off. Other accounts are unaffected. DMs remain subject to Telegram privacy and messaging restrictions.
