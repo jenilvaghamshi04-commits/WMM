@@ -281,7 +281,7 @@ class GatewayTests(unittest.TestCase):
             await self.app.deliver(self.contact(1));original=self.app.records()[0]['delivery_id']
             body=self.app.Followup(delivery_id=original,message='Checking in with you.',request_id='repeat-followup-001')
             await self.app.follow_up(body);r=await self.app.follow_up(body)
-            self.assertTrue(r['already_sent']);self.assertEqual(len(c.sent),2);self.assertEqual(self.app.usage('101')['dm']['used'],2)
+            self.assertTrue(r['already_sent']);self.assertEqual(len(c.sent),2);self.assertEqual(self.app.usage('101')['dm']['used'],1)
         self.run_async(run())
     def test_followup_requires_original_telegram_identity(self):
         self.sender(user=555);self.setup_template()
@@ -290,12 +290,14 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as e:await self.app.follow_up(self.app.Followup(delivery_id=original,message='Hello again.',request_id='wrong-sender-001'))
             self.assertEqual(e.exception.status_code,409);self.assertEqual(new.sent,[])
         self.run_async(run())
-    def test_followup_respects_daily_cap(self):
+    def test_followup_to_existing_person_allowed_at_new_recipient_cap(self):
         self.sender();self.setup_template()
         async def run():
             for n in range(15):await self.app.deliver(self.contact(n))
             original=self.app.records()[-1]['delivery_id']
-            with self.assertRaises(HTTPException) as e:await self.app.follow_up(self.app.Followup(delivery_id=original,message='Following up.',request_id='cap-followup-001'))
+            await self.app.follow_up(self.app.Followup(delivery_id=original,message='Following up.',request_id='cap-followup-001'))
+            self.assertEqual(self.app.usage('101')['dm']['used'],15)
+            with self.assertRaises(HTTPException) as e:await self.app.deliver(self.contact(99))
             self.assertEqual(e.exception.status_code,429)
         self.run_async(run())
     def test_followup_rejects_unconfirmed_delivery(self):
@@ -328,7 +330,49 @@ class GatewayTests(unittest.TestCase):
         self.sender();d=self.run_async(self.app.status());self.assertEqual(len(d['accounts']),3)
         self.assertTrue(all('health' in a for a in d['accounts']));self.assertTrue(d['accounts'][0]['health']['connected'])
 
+    def test_username_and_token_personalization(self):
+        contact={'name':'Jenil','username':'jenil_test','role':'Admin','group':'WMM'}
+        self.assertEqual(self.app.personalize_message('Hey @username! I saw $TOKEN.',contact,'$LF'),'Hey @jenil_test! I saw $LF.')
+        self.assertEqual(self.app.personalize_message('{{username}} / {{token}}',contact,'LF'),'@jenil_test / $LF')
+        self.assertEqual(self.app.personalize_message('Hey @username!',{'name':'Jenil'},''),'Hey Jenil!')
+        with self.assertRaises(HTTPException):self.app.personalize_message('I saw $TOKEN',contact,'')
+        with self.assertRaises(HTTPException):self.app.normalize_token('invalid token with spaces')
+    def test_token_is_stored_with_actual_sent_text(self):
+        c=self.sender();cid=self.contact(1)
+        self.run_async(self.app.send(self.app.Send(id=cid,message='Hey @username! I saw $TOKEN.',token_symbol='LF')))
+        self.assertEqual(c.sent[0][1],'Hey Person 1! I saw $LF.')
+        record=self.app.records()[0];self.assertEqual(record['token_symbol'],'LF');self.assertEqual(record['message'],c.sent[0][1])
+    def test_followup_inherits_token_and_does_not_consume_another_dm_slot(self):
+        self.sender();cid=self.contact(1)
+        async def run():
+            await self.app.send(self.app.Send(id=cid,message='Hello @username, $TOKEN.',token_symbol='LF'))
+            first=self.app.records()[0]['delivery_id']
+            await self.app.follow_up(self.app.Followup(delivery_id=first,message='Following up about $TOKEN.',request_id='token-followup-001'))
+            record=self.app.records()[0];self.assertEqual(record['message'],'Following up about $LF.');self.assertEqual(record['token_symbol'],'LF');self.assertEqual(self.app.usage('101')['dm']['used'],1)
+        self.run_async(run())
+    def test_existing_recipient_followup_next_day_does_not_count_as_new(self):
+        self.sender();self.setup_template()
+        async def run():
+            with patch.object(self.app,'today',return_value='2026-10-22'):
+                await self.app.deliver(self.contact(1));first=self.app.records()[0]['delivery_id']
+            with patch.object(self.app,'today',return_value='2026-10-23'):
+                await self.app.follow_up(self.app.Followup(delivery_id=first,message='Hello again.',request_id='next-day-followup-001'))
+                self.assertEqual(self.app.usage('101')['dm']['used'],0);self.assertEqual(self.app.sent_in_current_quota('101'),0)
+                await self.app.deliver(self.contact(2));self.assertEqual(self.app.usage('101')['dm']['used'],1)
+        self.run_async(run())
+    def test_failed_retry_same_new_recipient_counts_once(self):
+        c=self.sender();self.setup_template();cid=self.contact(1);c.fail=errors.ChatWriteForbiddenError(request=None)
+        with self.assertRaises(errors.ChatWriteForbiddenError):self.run_async(self.app.deliver(cid))
+        self.assertEqual(self.app.usage('101')['dm']['used'],1)
+        c.fail=None;self.run_async(self.app.deliver(cid));self.assertEqual(self.app.usage('101')['dm']['used'],1)
+    def test_settings_store_token_for_checkbox_sends(self):
+        c=self.sender();cid=self.contact(1)
+        self.run_async(self.app.config(self.app.Config(template='Hi @username, $TOKEN.',token_symbol='$LF')))
+        self.run_async(self.app.sheet_send(self.app.SheetSend(id=cid)))
+        self.assertEqual(c.sent[0][1],'Hi Person 1, $LF.')
+
 if __name__=='__main__':unittest.main()
+
 
 
 

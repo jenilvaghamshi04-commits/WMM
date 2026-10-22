@@ -12,7 +12,7 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.0')
+app=FastAPI(title='WMM Team',version='3.1')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
 lock=asyncio.Lock();phone_hash={};clients={};startup_errors={}
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
@@ -26,6 +26,7 @@ db.execute('create table if not exists quota_resets(id text primary key, princip
 db.execute('create table if not exists dashboard_sessions(token_hash text primary key, username text, expires_at text)')
 db.execute('create table if not exists login_failures(client_hash text, at text)')
 db.execute('create table if not exists message_details(delivery_id text primary key, body text, recipient_name text, username text, sender_label text, followup_of text)')
+if 'token_symbol' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column token_symbol text not null default ''")
 db.execute('create table if not exists followup_requests(request_id text primary key, delivery_id text, parent_id text, message_hash text)')
 db.execute('create table if not exists meta(key text primary key, value text)')
 # Preserve confirmed legacy deliveries when upgrading from the single-account version.
@@ -82,7 +83,7 @@ def stamp():return datetime.now(timezone.utc).isoformat()
 def today():return datetime.now(TZ).date().isoformat()
 def settings():
     r=db.execute('select data from settings where id=1').fetchone()
-    return {'template':'','sheet_url':'','sender_account':1,**(json.loads(r[0]) if r else {})}
+    return {'template':'','sheet_url':'','sender_account':1,'token_symbol':'',**(json.loads(r[0]) if r else {})}
 def contacts():return [c for r in db.execute('select data from contacts') if not (c:=json.loads(r[0])).get('is_bot',False)]
 def save(c):db.execute('insert or replace into contacts values(?,?)',(c['id'],json.dumps(c)));db.commit()
 def session_path(slot):return str(ROOT/('telegram' if slot==1 else f'telegram_{slot}'))
@@ -119,19 +120,30 @@ def quota_floor(principal,kind,date):
     r=db.execute('select max(after_rowid) from quota_resets where principal=? and kind=? and day=?',(principal,kind,date)).fetchone()
     return r[0] or 0
 
+def new_dm_count(principal,date,floor=0,confirmed_only=False):
+    successful=" and o.status='Sent'" if confirmed_only else ''
+    query="""select count(distinct o.target) from outbox o
+        where o.principal=? and o.kind='dm' and o.day=? and o.rowid>?
+        and not exists(select 1 from outbox prior where prior.principal=o.principal and prior.kind='dm'
+        and prior.target=o.target and prior.status='Sent' and prior.rowid<o.rowid)"""+successful
+    return db.execute(query,(principal,date,floor)).fetchone()[0]
+
+def dm_needs_new_slot(principal,target,date):
+    existing=db.execute("select 1 from outbox where principal=? and kind='dm' and target=? and status='Sent' limit 1",(principal,target)).fetchone()
+    counted=db.execute("select 1 from outbox where principal=? and kind='dm' and target=? and day=? and rowid>? limit 1",(principal,target,date,quota_floor(principal,'dm',date))).fetchone()
+    return not (existing or counted)
+
 def usage(principal):
     date=today();result={}
     for kind,limit in LIMITS.items():
         floor=quota_floor(principal,kind,date)
-        count=db.execute('select count(*) from outbox where principal=? and kind=? and day=? and rowid>?',(principal,kind,date,floor)).fetchone()[0]
-        result[kind]={'used':count,'limit':limit,'remaining':max(0,limit-count)}
+        count=new_dm_count(principal,date,floor) if kind=='dm' else db.execute('select count(*) from outbox where principal=? and kind=? and day=? and rowid>?',(principal,kind,date,floor)).fetchone()[0]
+        result[kind]={'used':count,'limit':limit,'remaining':max(0,limit-count),'basis':'new_recipients' if kind=='dm' else 'message_attempts'}
     return result
 
 def sent_in_current_quota(principal):
-    date=today();total=0
-    for kind in LIMITS:
-        total+=db.execute("select count(*) from outbox where principal=? and kind=? and day=? and rowid>? and status='Sent'",(principal,kind,date,quota_floor(principal,kind,date))).fetchone()[0]
-    return total
+    date=today()
+    return new_dm_count(principal,date,quota_floor(principal,'dm',date),True)+db.execute("select count(*) from outbox where principal=? and kind='group' and day=? and rowid>? and status='Sent'",(principal,date,quota_floor(principal,'group',date))).fetchone()[0]
 
 def reset_records():
     keys=['reset_id','principal','account_id','kind','day','after_rowid','at','before_used','request_id']
@@ -156,9 +168,9 @@ def records():
     keys=['delivery_id','principal','account_id','kind','target','id','status','day','at','error','message_hash']
     result=[]
     for r in db.execute('select * from outbox order by at desc').fetchall():
-        d=dict(zip(keys,r));detail=db.execute('select body,recipient_name,username,sender_label,followup_of from message_details where delivery_id=?',(d['delivery_id'],)).fetchone()
+        d=dict(zip(keys,r));detail=db.execute('select body,recipient_name,username,sender_label,followup_of,token_symbol from message_details where delivery_id=?',(d['delivery_id'],)).fetchone()
         saved=db.execute('select data from contacts where id=?',(d['id'],)).fetchone();contact=json.loads(saved[0]) if saved else {}
-        d.update(dict(zip(['message','recipient_name','username','sender_label','followup_of'],detail)) if detail else {'message':None,'recipient_name':contact.get('name',d['target']),'username':contact.get('username',''),'sender_label':f"Account {d['account_id']}",'followup_of':None})
+        d.update(dict(zip(['message','recipient_name','username','sender_label','followup_of','token_symbol'],detail)) if detail else {'message':None,'recipient_name':contact.get('name',d['target']),'username':contact.get('username',''),'sender_label':f"Account {d['account_id']}",'followup_of':None,'token_symbol':''})
         result.append(d)
     return result
 @app.on_event('startup')
@@ -183,10 +195,11 @@ class Account(BaseModel):account_id:int=Field(default=1,ge=1,le=3)
 class Login(Account):phone:str
 class Verify(Account):phone:str;code:str='';password:str=''
 class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False
-class Config(BaseModel):template:str='';sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3)
-class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None
+class Config(BaseModel):template:str='';sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3);token_symbol:str=Field(default='',max_length=33)
+class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None;token_symbol:str|None=Field(default=None,max_length=33)
 class SheetSend(BaseModel):id:str
 class Followup(BaseModel):
+    token_symbol:str|None=Field(default=None,max_length=33)
     delivery_id:str
     message:str=Field(min_length=1,max_length=4096)
     request_id:str=Field(min_length=8,max_length=128)
@@ -195,7 +208,7 @@ class ResetQuota(Account):
     request_id:str=Field(min_length=8,max_length=128)
 class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
-async def health():return {'service':'teamradar','ok':True,'version':'3.0'}
+async def health():return {'service':'teamradar','ok':True,'version':'3.1'}
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -229,7 +242,7 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,''))})
-    return {'version':'3.0','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records()}
+    return {'version':'3.1','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True}}
 @app.post('/reset-daily-limits',dependencies=[Depends(auth)])
 async def reset_daily_limits(body:ResetQuota):
     async with lock:
@@ -349,9 +362,24 @@ async def scan(body:Scan):
         except errors.RPCError as exc:raise HTTPException(400,str(exc))
 @app.post('/settings',dependencies=[Depends(auth)])
 async def config(body:Config):
+    body.token_symbol=normalize_token(body.token_symbol)
     if body.sheet_url and 'docs.google.com/spreadsheets/d/' not in body.sheet_url:raise HTTPException(400,'Paste a Google Sheets URL, not a Google Doc')
     db.execute('insert or replace into settings values(1,?)',(body.model_dump_json(),));db.commit();return {'ok':True}
-async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=None,expected_principal=None):
+def normalize_token(value):
+    symbol=(value or '').strip().lstrip('$')
+    if symbol and not re.fullmatch(r'[A-Za-z0-9._-]{1,32}',symbol):raise HTTPException(400,'Use a token symbol of up to 32 letters, numbers, dots, underscores or hyphens')
+    return symbol
+
+def personalize_message(text,contact,token_symbol=''):
+    symbol=normalize_token(token_symbol)
+    if (re.search(r'\$TOKEN\b',text) or '{{token}}' in text) and not symbol:raise HTTPException(400,'Enter the token name above the message preview before sending')
+    handle='@'+contact['username'].lstrip('@') if contact.get('username') else (contact.get('name') or 'there')
+    text=text.replace('@{{username}}',handle).replace('{{username}}',handle).replace('@username',handle)
+    text=text.replace('{{name}}',contact.get('name','')).replace('{{role}}',contact.get('role','')).replace('{{group}}',contact.get('group',''))
+    text=text.replace('{{token}}','$'+symbol if symbol else '')
+    return re.sub(r'\$TOKEN\b',lambda match:'$'+symbol,text)
+
+async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=None,expected_principal=None,token_symbol=None):
     async with lock:
         c=await ready(slot);principal=await identify(slot,c)
         row=db.execute('select data from contacts where id=?',(cid,)).fetchone()
@@ -363,7 +391,8 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if kind=='group' and contact.get('membership',{}).get(str(slot))=='left':raise HTTPException(409,f'Account {slot} left this group. Rejoin and rescan with Leave group after scan switched off before sending group messages.')
         text=(message if message is not None else settings()['template']).strip()
         if not text:raise HTTPException(400,'Write your message before sending')
-        text=text.replace('{{name}}',contact['name']).replace('{{role}}',contact['role']).replace('{{group}}',contact['group'])
+        symbol=normalize_token(settings().get('token_symbol','') if token_symbol is None else token_symbol)
+        text=personalize_message(text,contact,symbol)
         digest=hashlib.sha256(text.encode()).hexdigest()
         target=str(contact['group_id'] if kind=='group' else contact['user_id'])
         date=today()
@@ -383,7 +412,7 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         info=db.execute('select blocked_until from account_info where slot=?',(slot,)).fetchone()
         if info and info[0] and info[0]>stamp():raise HTTPException(429,'This account is paused by Telegram until '+info[0])
         u=usage(principal)[kind]
-        if u['remaining']<=0:raise HTTPException(429,f"Account {slot} reached today's {LIMITS[kind]} {'DM' if kind=='dm' else 'group message'} limit. Resets at midnight Asia/Kolkata.")
+        if u['remaining']<=0 and (kind!='dm' or dm_needs_new_slot(principal,target,date)):raise HTTPException(429,f"Account {slot} reached today's {LIMITS[kind]} {'new DM recipient' if kind=='dm' else 'group message'} limit. Resets at midnight Asia/Kolkata.")
         # Resolve the destination using this sender's own Telegram permissions before reserving a send.
         try:
             if kind=='group':peer=await c.get_entity(int(target))
@@ -395,11 +424,11 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if kind=='dm' and getattr(peer,'bot',False):raise HTTPException(400,'This contact is a Telegram bot. Bot admins are excluded.')
         if kind=='group' and not (isinstance(peer,types.Chat) or getattr(peer,'megagroup',False)):raise HTTPException(400,'The selected destination is not a group chat')
         delivery_id=uuid.uuid4().hex
-        # Count every dispatched attempt, including failures and uncertain sends, toward the daily cap.
+        # Record all attempts. DM quota counts unique new recipients; group quota counts attempts.
         sender_label=db.execute('select label from account_info where slot=?',(slot,)).fetchone()[0]
         with db:
             db.execute('insert into outbox values(?,?,?,?,?,?,?,?,?,?,?)',(delivery_id,principal,slot,kind,target,cid,'Sending',date,stamp(),'',digest))
-            db.execute('insert into message_details values(?,?,?,?,?,?)',(delivery_id,text,contact['name'],contact.get('username',''),sender_label,followup_of))
+            db.execute('insert into message_details(delivery_id,body,recipient_name,username,sender_label,followup_of,token_symbol) values(?,?,?,?,?,?,?)',(delivery_id,text,contact['name'],contact.get('username',''),sender_label,followup_of,symbol))
             if followup_of:db.execute('insert into followup_requests values(?,?,?,?)',(request_id,delivery_id,followup_of,digest))
         try:await c.send_message(peer,text)
         except errors.FloodWaitError as exc:
@@ -415,14 +444,16 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         db.execute('update outbox set status=?,at=? where id=?',('Sent',stamp(),delivery_id));db.commit()
         return {'status':'Sent','id':cid,'account_id':slot,'kind':kind,'usage':usage(principal)}
 @app.post('/send',dependencies=[Depends(auth)])
-async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message)
+async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message,token_symbol=body.token_symbol)
 @app.post('/follow-up',dependencies=[Depends(auth)])
 async def follow_up(body:Followup):
     parent=db.execute('select principal,slot,kind,contact_id,status from outbox where id=?',(body.delivery_id,)).fetchone()
     if not parent:raise HTTPException(404,'Original message not found')
     principal,slot,kind,cid,status=parent
     if status!='Sent':raise HTTPException(409,'Follow-ups require a confirmed sent message')
-    return await deliver(cid,slot,kind,body.message,followup_of=body.delivery_id,request_id=body.request_id,expected_principal=principal)
+    saved_token=db.execute('select token_symbol from message_details where delivery_id=?',(body.delivery_id,)).fetchone()
+    symbol=body.token_symbol if body.token_symbol is not None else (saved_token[0] if saved_token else '')
+    return await deliver(cid,slot,kind,body.message,followup_of=body.delivery_id,request_id=body.request_id,expected_principal=principal,token_symbol=symbol)
 
 @app.post('/sheet-send',dependencies=[Depends(auth)])
 async def sheet_send(body:SheetSend):
