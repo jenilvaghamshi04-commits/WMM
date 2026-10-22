@@ -4,10 +4,11 @@
   function type(contact){return contact.kind||'dm'}
   function timestamp(value){const n=Date.parse(value);return Number.isFinite(n)?n:0}
   function latestFirst(rows,getTime=row=>row.at){return rows.slice().sort((a,b)=>timestamp(getTime(b))-timestamp(getTime(a)))}
-  function latestContacts(contacts,history){
+  function latestContacts(contacts,history,leads=[]){
+    const leadTimes=new Map(leads.map(l=>[l.key,timestamp(l.last_activity_at)]));
     const latest=new Map();
     for(const d of history){const key=(d.kind||'dm')+':'+String(d.target),time=timestamp(d.at);latest.set(key,Math.max(latest.get(key)||0,time))}
-    return contacts.map(contact=>{const kind=type(contact),target=kind==='group'?contact.group_id:contact.user_id;return {contact,time:Math.max(timestamp(contact.scanned_at),latest.get(kind+':'+String(target))||0)}}).sort((a,b)=>b.time-a.time).map(row=>row.contact);
+    return contacts.map(contact=>{const kind=type(contact),target=kind==='group'?contact.group_id:contact.user_id;return {contact,time:Math.max(timestamp(contact.scanned_at),latest.get(kind+':'+String(target))||0,leadTimes.get(kind+':'+String(target))||0)}}).sort((a,b)=>b.time-a.time).map(row=>row.contact);
   }
   function latestAccounts(accounts,contacts,history,resets){
     return accounts.map(account=>{const times=[account.health?.last_sent_at,account.health?.last_error_at,...contacts.filter(c=>c.scan_account===account.id).map(c=>c.scanned_at),...history.filter(d=>d.account_id===account.id).map(d=>d.at),...resets.filter(r=>r.account_id===account.id).map(r=>r.at)];return {account,time:times.reduce((n,t)=>Math.max(n,timestamp(t)),0)}}).sort((a,b)=>b.time-a.time).map(row=>row.account);
@@ -21,10 +22,11 @@
     const k=type(contact),target=String(k==='group'?contact.group_id:contact.user_id);
     return summarize(history.filter(d=>(d.kind||'dm')===k&&(d.id===contact.id||(target!=='undefined'&&String(d.target)===target))));
   }
-  function conversations(history){
+  function conversations(history,leads=[]){
+    const leadTimes=new Map(leads.map(l=>[l.key,l.last_activity_at]));
     const grouped=new Map();
     for(const d of history){const key=(d.kind||'dm')+':'+(d.target??d.id);if(!grouped.has(key))grouped.set(key,[]);grouped.get(key).push(d)}
-    return latestFirst([...grouped.values()].map(summarize),s=>s.latest.at);
+    return latestFirst([...grouped.entries()].map(([key,rows])=>{const s=summarize(rows),activity=leadTimes.get(key);s.activity_at=timestamp(activity)>timestamp(s.latest.at)?activity:s.latest.at;return s}),s=>s.activity_at);
   }
   function normalizeToken(value){return String(value||'').trim().replace(/^\$+/,'')}
   function requiresToken(text){return /\$TOKEN\b|\{\{token\}\}/.test(text||'')}

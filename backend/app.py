@@ -6,15 +6,15 @@ from typing import Literal
 from fastapi import FastAPI,Depends,Header,HTTPException,Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel,SecretStr,Field
-from telethon import TelegramClient,functions,types,errors,utils
+from telethon import TelegramClient,functions,types,errors,utils,events
 
 ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True);os.chmod(ROOT,0o700)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.1')
+app=FastAPI(title='WMM Team',version='3.2')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
-lock=asyncio.Lock();phone_hash={};clients={};startup_errors={}
+lock=asyncio.Lock();phone_hash={};clients={};startup_errors={};reply_task=None
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
 db.execute('create table if not exists contacts(id text primary key, data text)')
 db.execute('create table if not exists settings(id integer primary key, data text)')
@@ -29,6 +29,10 @@ db.execute('create table if not exists message_details(delivery_id text primary 
 if 'token_symbol' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column token_symbol text not null default ''")
 db.execute('create table if not exists followup_requests(request_id text primary key, delivery_id text, parent_id text, message_hash text)')
 db.execute('create table if not exists meta(key text primary key, value text)')
+db.execute("create table if not exists lead_settings(key text primary key, stage text, reminder_days integer not null default 3, reminders_enabled integer not null default 1, acknowledged_at text not null default '', updated_at text not null default '')")
+db.execute('create table if not exists replies(principal text, target text, message_id integer, slot integer, at text, body text, primary key(principal,target,message_id))')
+db.execute('create index if not exists reply_target on replies(target,at)')
+db.execute('create table if not exists reply_sync(principal text, target text, cursor integer not null default 0, checked_at text, next_check_at text, complete integer not null default 0, error text, primary key(principal,target))')
 # Preserve confirmed legacy deliveries when upgrading from the single-account version.
 if not db.execute("select 1 from meta where key='outbox_migrated'").fetchone():
     for cid,status,at,error in db.execute('select * from deliveries').fetchall():
@@ -93,7 +97,7 @@ def session_path(slot):return str(ROOT/('telegram' if slot==1 else f'telegram_{s
 def make_client(slot):
     r=db.execute('select api_id,api_hash from telegram_api where id=?',(slot,)).fetchone()
     api_id,api_hash=r if r else ((API_ID,API_HASH) if slot==1 else (None,None))
-    return TelegramClient(session_path(slot),int(api_id),api_hash,flood_sleep_threshold=0) if api_id and api_hash else None
+    return attach_reply_listener(TelegramClient(session_path(slot),int(api_id),api_hash,flood_sleep_threshold=0),slot) if api_id and api_hash else None
 def require_client(slot):
     c=clients.get(slot)
     if c is None:raise HTTPException(409,f'Configure the API for Account {slot} in Connections first')
@@ -176,15 +180,154 @@ def records():
         d.update(dict(zip(['message','recipient_name','username','sender_label','followup_of','token_symbol'],detail)) if detail else {'message':None,'recipient_name':contact.get('name',d['target']),'username':contact.get('username',''),'sender_label':f"Account {d['account_id']}",'followup_of':None,'token_symbol':''})
         result.append(d)
     return result
+LEAD_STAGES=('New','Contacted','Replied','Meeting','Proposal','Client')
+def lead_key(contact):return ('group:'+str(contact.get('group_id'))) if contact.get('kind')=='group' else ('dm:'+str(contact.get('user_id')))
+def lead_config(key):
+    row=db.execute('select stage,reminder_days,reminders_enabled,acknowledged_at,updated_at from lead_settings where key=?',(key,)).fetchone()
+    return dict(zip(('stage','reminder_days','reminders_enabled','acknowledged_at','updated_at'),row)) if row else {'stage':None,'reminder_days':3,'reminders_enabled':1,'acknowledged_at':'','updated_at':''}
+def advance_lead(key,stage):
+    cfg=lead_config(key);current=cfg['stage'] or 'New'
+    if LEAD_STAGES.index(current)>=LEAD_STAGES.index(stage):return
+    db.execute('insert into lead_settings(key,stage,updated_at) values(?,?,?) on conflict(key) do update set stage=excluded.stage,updated_at=excluded.updated_at',(key,stage,stamp()));db.commit()
+def record_reply(principal,target,slot,message):
+    if getattr(message,'out',False) or getattr(message,'action',None) or not getattr(message,'date',None) or not getattr(message,'id',None):return False
+    first=db.execute("select min(at) from outbox where principal=? and target=? and kind='dm' and status='Sent'",(str(principal),str(target))).fetchone()[0]
+    if not first:return False
+    at=message.date
+    if at.tzinfo is None:at=at.replace(tzinfo=timezone.utc)
+    if at<datetime.fromisoformat(first).replace(microsecond=0):return False
+    text=(getattr(message,'raw_text',None) or getattr(message,'message',None) or '[Media message]')[:4096]
+    cursor=db.execute('insert or ignore into replies values(?,?,?,?,?,?)',(str(principal),str(target),message.id,slot,at.astimezone(timezone.utc).isoformat(),text));db.commit()
+    if cursor.rowcount:advance_lead('dm:'+str(target),'Replied')
+    return bool(cursor.rowcount)
+def attach_reply_listener(client,slot):
+    if not hasattr(client,'add_event_handler'):return client
+    async def incoming(event):
+        if not getattr(event,'is_private',False) or not getattr(event,'sender_id',None):return
+        target=str(event.sender_id)
+        if not db.execute("select 1 from outbox where target=? and kind='dm' and status='Sent'",(target,)).fetchone():return
+        try:
+            me=await client.get_me()
+            async with lock:record_reply(str(me.id),target,slot,event.message)
+        except (errors.RPCError,OSError,asyncio.TimeoutError):pass
+    client.add_event_handler(incoming,events.NewMessage(incoming=True))
+    return client
+
+def lead_records():
+    contacts_by_key={}
+    for c in contacts():contacts_by_key.setdefault(lead_key(c),c)
+    grouped={}
+    for d in records():
+        key=d['kind']+':'+str(d['target']);grouped.setdefault(key,[]).append(d)
+        contacts_by_key.setdefault(key,{'id':d['id'],'name':d['recipient_name'],'username':d['username'],'kind':d['kind'],'user_id':d['target'],'group_id':d['target'],'group':''})
+    result=[];now=datetime.now(timezone.utc)
+    for key,contact in contacts_by_key.items():
+        rows=grouped.get(key,[]);sent=[d for d in rows if d['status']=='Sent'];pending=any(d['status'] in ('Sending','Uncertain') for d in rows)
+        cfg=lead_config(key);kind,target=key.split(':',1)
+        reply_rows=db.execute('select r.principal,r.slot,r.at,r.body,r.message_id from replies r where r.target=? and exists(select 1 from outbox o where o.principal=r.principal and o.target=r.target and o.kind=\'dm\' and o.status=\'Sent\') order by r.at desc,r.message_id desc limit 20',(target,)).fetchall() if kind=='dm' else []
+        replies=[dict(zip(('principal','account_id','at','body','message_id'),r)) for r in reply_rows]
+        replied=bool(replies);latest_reply=replies[0] if replied else None
+        stage=cfg['stage'] or ('Replied' if replied else 'Contacted' if sent else 'New')
+        last_sent=sent[0] if sent else None
+        due_at=(datetime.fromisoformat(last_sent['at'])+timedelta(days=cfg['reminder_days'])).isoformat() if last_sent and kind=='dm' else None
+        reminder_active=bool(kind=='dm' and last_sent and cfg['reminders_enabled'] and not replied and stage!='Client' and not pending)
+        sync_rows=db.execute('select principal,checked_at,complete,error from reply_sync where target=?',(target,)).fetchall() if kind=='dm' else []
+        principals={d['principal'] for d in sent};sync_rows=[r for r in sync_rows if r[0] in principals]
+        sync_error=next((r[3] for r in sync_rows if r[3]),'')
+        fully_checked=bool(principals and len(sync_rows)==len(principals) and all(r[2] and not r[3] for r in sync_rows))
+        last_activity=max([contact.get('scanned_at') or '',cfg['updated_at'] or '',latest_reply['at'] if replied else '',rows[0]['at'] if rows else ''])
+        result.append({'key':key,'contact_id':contact['id'],'name':contact.get('name',target),'username':contact.get('username',''),'group':contact.get('group',''),'kind':kind,'target':target,'stage':stage,'reply_status':'Replied' if replied else 'Awaiting reply' if sent and kind=='dm' else 'Not tracked' if kind=='group' else 'Not contacted','latest_reply':latest_reply,'replies':replies,'needs_attention':bool(replied and latest_reply['at']>cfg['acknowledged_at'] and stage!='Client'),'reminder_days':cfg['reminder_days'],'reminders_enabled':bool(cfg['reminders_enabled']),'reminder_active':reminder_active,'due_at':due_at if reminder_active else None,'followup_due':bool(reminder_active and datetime.fromisoformat(due_at)<=now),'reminder_reason':'Stopped — reply received' if replied else 'Complete' if stage=='Client' else 'Paused' if not cfg['reminders_enabled'] else 'Review uncertain delivery' if pending else 'Direct messages only' if kind=='group' else 'Waiting for first send' if not last_sent else 'Scheduled','last_sent_at':last_sent['at'] if last_sent else None,'followup_delivery_id':last_sent['delivery_id'] if last_sent else None,'last_activity_at':last_activity,'sync_checked_at':max([r[1] or '' for r in sync_rows],default=''),'sync_complete':fully_checked,'sync_error':sync_error})
+    return sorted(result,key=lambda r:r['last_activity_at'],reverse=True)
+
+class LeadUpdate(BaseModel):
+    key:str=Field(max_length=100)
+    stage:Literal['New','Contacted','Replied','Meeting','Proposal','Client']|None=None
+    reminder_days:Literal[3,5,7]|None=None
+    reminders_enabled:bool|None=None
+    acknowledge:bool=False
+class ReplySync(BaseModel):key:str|None=Field(default=None,max_length=100)
+@app.post('/leads/update',dependencies=[Depends(auth)])
+async def update_lead(body:LeadUpdate):
+    async with lock:
+        if not any(r['key']==body.key for r in lead_records()):raise HTTPException(404,'Lead not found')
+        cfg=lead_config(body.key)
+        if body.stage is not None:cfg['stage']=body.stage
+        if body.reminder_days is not None:cfg['reminder_days']=body.reminder_days
+        if body.reminders_enabled is not None:cfg['reminders_enabled']=int(body.reminders_enabled)
+        if body.acknowledge:cfg['acknowledged_at']=stamp()
+        cfg['updated_at']=stamp()
+        db.execute('insert or replace into lead_settings values(?,?,?,?,?,?)',(body.key,cfg['stage'],cfg['reminder_days'],cfg['reminders_enabled'],cfg['acknowledged_at'],cfg['updated_at']));db.commit()
+        return {'ok':True,'lead':next(r for r in lead_records() if r['key']==body.key)}
+
+async def sync_reply_pair(principal,target,slot,first_at):
+    async with lock:
+        checked=stamp();row=db.execute('select cursor from reply_sync where principal=? and target=?',(principal,target)).fetchone();cursor=row[0] if row else 0
+        try:
+            client=None
+            for candidate_slot in [slot]+[other for other in (1,2,3) if other!=slot]:
+                candidate=clients.get(candidate_slot)
+                if not candidate:continue
+                try:
+                    candidate=await ready(candidate_slot);me=await candidate.get_me()
+                    if str(me.id)==principal:client=candidate;slot=candidate_slot;break
+                except (HTTPException,errors.RPCError,OSError):continue
+            if client is None:raise HTTPException(409,'Reconnect the original sender to check replies')
+            peer=await client.get_input_entity(int(target))
+            options={'limit':100,'min_id':cursor,'reverse':True}
+            if not cursor:options['offset_date']=datetime.fromisoformat(first_at).replace(microsecond=0)-timedelta(seconds=1)
+            messages=await asyncio.wait_for(client.get_messages(peer,**options),timeout=12)
+            for message in messages:
+                if message:record_reply(principal,target,slot,message)
+            cursor=max([cursor]+[m.id for m in messages if m and getattr(m,'id',None)])
+            complete=len(messages)<100
+            next_at=(datetime.now(timezone.utc)+timedelta(seconds=300 if complete else 15)).isoformat()
+            db.execute('insert or replace into reply_sync values(?,?,?,?,?,?,?)',(principal,target,cursor,checked,next_at,int(complete),''));db.commit()
+            return {'target':target,'ok':True,'complete':complete}
+        except (errors.RPCError,HTTPException,ValueError,OSError,asyncio.TimeoutError) as exc:
+            delay=max(600,getattr(exc,'seconds',0)+5)
+            detail=exc.detail if isinstance(exc,HTTPException) else 'Telegram reply check failed. Retry when this account is available.'
+            if isinstance(exc,errors.FloodWaitError):detail=f'Telegram requests a {exc.seconds}s wait before checking again.'
+            next_at=(datetime.now(timezone.utc)+timedelta(seconds=delay)).isoformat()
+            db.execute('insert or replace into reply_sync values(?,?,?,?,?,?,?)',(principal,target,cursor,checked,next_at,0,detail));db.commit()
+            return {'target':target,'ok':False,'error':detail}
+async def sync_replies(key=None,limit=1):
+    pairs=db.execute("select principal,target,slot,min(at) from outbox where kind='dm' and status='Sent' group by principal,target").fetchall()
+    candidates=[];now=stamp()
+    for principal,target,slot,first in pairs:
+        if key and key!='dm:'+target:continue
+        state=db.execute('select checked_at,next_check_at,error from reply_sync where principal=? and target=?',(principal,target)).fetchone()
+        # Preserve Telegram/error backoff; an explicit check can refresh a successful check after 30 seconds.
+        if state and state[1]>now and (not key or state[2] or (datetime.now(timezone.utc)-datetime.fromisoformat(state[0])).total_seconds()<30):continue
+        candidates.append((state[0] if state else '',principal,target,slot,first))
+    candidates.sort(key=lambda r:r[0]);results=[]
+    for _,principal,target,slot,first in candidates[:limit]:results.append(await sync_reply_pair(principal,target,slot,first))
+    return {'checked':len(results),'remaining':max(0,len(candidates)-len(results)),'results':results}
+@app.post('/replies/sync',dependencies=[Depends(auth)])
+async def check_replies(body:ReplySync):
+    if body.key and (not body.key.startswith('dm:') or not any(r['key']==body.key for r in lead_records())):raise HTTPException(400,'Choose a direct-message lead')
+    return await sync_replies(body.key,limit=3)
+async def reply_sync_loop():
+    while True:
+        await asyncio.sleep(15)
+        try:await sync_replies(limit=1)
+        except asyncio.CancelledError:raise
+        except Exception:pass  # One unavailable session must not stop checking other senders.
+
 @app.on_event('startup')
 async def start():
+    global reply_task
     for slot in (1,2,3):
         try:
             c=make_client(slot)
             if c:clients[slot]=c;await c.connect()
         except Exception:startup_errors[slot]='Telegram connection unavailable. Reconnect this account in Connections.'
+    reply_task=asyncio.create_task(reply_sync_loop())
 @app.on_event('shutdown')
 async def stop():
+    if reply_task:
+        reply_task.cancel()
+        try:await reply_task
+        except asyncio.CancelledError:pass
     for c in clients.values():await c.disconnect()
 @app.exception_handler(errors.FloodWaitError)
 async def flood(request,exc):
@@ -214,7 +357,7 @@ class ResetQuota(Account):
     request_id:str=Field(min_length=8,max_length=128)
 class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
-async def health():return {'service':'teamradar','ok':True,'version':'3.1'}
+async def health():return {'service':'teamradar','ok':True,'version':'3.2'}
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -229,7 +372,7 @@ async def configure_telegram_api(body:TelegramAPI):
             await candidate.disconnect()
             raise HTTPException(502,'Could not reach Telegram. API settings were not saved; try again later.')
         db.execute('insert or replace into telegram_api values(?,?,?)',(slot,body.api_id,value));db.commit()
-        clients[slot]=candidate;startup_errors.pop(slot,None)
+        clients[slot]=attach_reply_listener(candidate,slot);startup_errors.pop(slot,None)
     return {'api_configured':True,'account_id':slot}
 @app.get('/status',dependencies=[Depends(auth)])
 async def status():
@@ -248,7 +391,7 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,''))})
-    return {'version':'3.1','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True}}
+    return {'version':'3.2','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True}}
 @app.post('/reset-daily-limits',dependencies=[Depends(auth)])
 async def reset_daily_limits(body:ResetQuota):
     async with lock:
@@ -456,6 +599,7 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         except Exception:
             db.execute('update outbox set status=?,error=? where id=?',('Uncertain','Check Telegram before retrying',delivery_id));db.commit();raise HTTPException(502,'Delivery uncertain. Check Telegram before retrying.')
         db.execute('update outbox set status=?,at=? where id=?',('Sent',stamp(),delivery_id));db.commit()
+        advance_lead(kind+':'+target,'Contacted')
         return {'status':'Sent','id':cid,'account_id':slot,'kind':kind,'usage':usage(principal)}
 @app.post('/send',dependencies=[Depends(auth)])
 async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message,token_symbol=body.token_symbol)
