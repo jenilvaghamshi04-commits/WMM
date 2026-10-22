@@ -136,6 +136,22 @@ def sent_in_current_quota(principal):
 def reset_records():
     keys=['reset_id','principal','account_id','kind','day','after_rowid','at','before_used','request_id']
     return [dict(zip(keys,r)) for r in db.execute('select * from quota_resets order by rowid desc limit 100')]
+def account_health(principal,client,authorized,blocked_until,startup_error=''):
+    try:connected=bool(client and client.is_connected())
+    except Exception:connected=False
+    metrics=dict(db.execute('select status,count(*) from outbox where principal=? and day=? group by status',(principal,today())).fetchall())
+    uncertain_total=db.execute("select count(*) from outbox where principal=? and status='Uncertain'",(principal,)).fetchone()[0]
+    last_sent=db.execute("select at from outbox where principal=? and status='Sent' order by at desc limit 1",(principal,)).fetchone()
+    last_error=db.execute("select error,at from outbox where principal=? and status in ('Failed','Uncertain') order by at desc limit 1",(principal,)).fetchone()
+    paused=bool(blocked_until and blocked_until>stamp())
+    if not client:state='Not configured'
+    elif not connected:state='Disconnected'
+    elif not authorized:state='Login required'
+    elif paused:state='Paused'
+    elif metrics.get('Failed',0) or uncertain_total or startup_error:state='Needs review'
+    else:state='Ready'
+    return {'state':state,'connected':connected,'checked_at':stamp(),'failed_today':metrics.get('Failed',0),'uncertain_today':metrics.get('Uncertain',0),'uncertain_total':uncertain_total,'sent_today_total':metrics.get('Sent',0),'last_sent_at':last_sent[0] if last_sent else None,'last_error':startup_error or (last_error[0] if last_error else ''),'last_error_at':last_error[1] if last_error else None,'blocked_until':blocked_until if paused else None}
+
 def records():
     keys=['delivery_id','principal','account_id','kind','target','id','status','day','at','error','message_hash']
     result=[]
@@ -212,7 +228,7 @@ async def status():
             if row:principal,label,phone,blocked=row
         u=usage(principal)
         sent=sent_in_current_quota(principal)
-        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,'')})
+        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,''))})
     return {'version':'3.0','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records()}
 @app.post('/reset-daily-limits',dependencies=[Depends(auth)])
 async def reset_daily_limits(body:ResetQuota):

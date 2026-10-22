@@ -72,3 +72,11 @@ The dashboard contains no sample contacts or demo labels. Three real account slo
 - **Sent messages** shows recipient, username, original sender account, message text, delivery time and status. New sends store these details durably. Earlier records are preserved; their message text cannot be reconstructed and is labeled unavailable.
 - A **Send follow-up** button appears for confirmed sent records. It sends the custom follow-up from the original Telegram identity, checks its current quota and Telegram restrictions, and records a linked delivery. Swapping another identity into the old account slot does not authorize it to follow up. Repeated requests with the same ID do not send twice. Identical previously sent text is blocked; uncertain deliveries need review. Follow-ups are manual, not scheduled.
 - Deploy the latest GitHub commit on Render before using the new login endpoint. A persistent DATA_DIR is required to keep contacts, history, sessions and quotas across Render restarts.
+
+## Direct messaging on Saved data and account health
+
+Saved data now has per-row Send message, Send follow-up and Preview / history actions. Initial message dialogs include their own sender selector, editable text and personalized preview. Follow-up dialogs preview the text and use the original sender. Both actions refresh statuses on the current page without navigating away; Sent messages keeps the same follow-up action. Rows show the latest status, sender/time, total confirmed sends and confirmed follow-up count. Recipient history is matched by Telegram identity across scanned groups, so an existing send is visible on duplicate contact rows too. Uncertain deliveries block more sends until reviewed. DM and group lists can be selected directly on Saved data.
+
+Account health displays the three accounts' API configuration, Telegram connection and login status, DM/group allowances, actual confirmed sends today, failed attempts, unresolved uncertain deliveries, last successful send, latest recorded error and known pause expiry. Refresh health checks the current sessions and stored records. It is not an external Telegram ban/reputation diagnosis. Quota resets do not erase actual delivery/error history.
+
+Additional frontend state checks: `node tests/test_message_model.cjs`.

@@ -307,7 +307,29 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(e.exception.status_code,409)
         self.run_async(run())
 
+    def test_account_health_not_configured_and_disconnected(self):
+        h=self.app.account_health('101',None,False,'');self.assertEqual(h['state'],'Not configured')
+        c=FakeClient();c.is_connected=lambda:False
+        self.assertEqual(self.app.account_health('101',c,False,'')['state'],'Disconnected')
+    def test_account_health_reports_known_pause(self):
+        c=self.sender();h=self.app.account_health('101',c,True,'2099-01-01T00:00:00+00:00')
+        self.assertEqual(h['state'],'Paused');self.assertIsNotNone(h['blocked_until'])
+    def test_account_health_counts_failures_and_latest_error(self):
+        c=self.sender();c.fail=errors.ChatWriteForbiddenError(request=None);self.setup_template()
+        with self.assertRaises(errors.ChatWriteForbiddenError):self.run_async(self.app.deliver(self.contact(1)))
+        h=self.app.account_health('101',c,True,'')
+        self.assertEqual(h['state'],'Needs review');self.assertEqual(h['failed_today'],1);self.assertTrue(h['last_error'])
+    def test_health_actual_sent_count_is_not_erased_by_quota_reset(self):
+        c=self.sender();self.setup_template();self.run_async(self.app.deliver(self.contact(1)))
+        self.run_async(self.app.reset_daily_limits(self.app.ResetQuota(request_id='health-reset-001')))
+        h=self.app.account_health('101',c,True,'')
+        self.assertEqual(h['state'],'Ready');self.assertEqual(h['sent_today_total'],1);self.assertEqual(self.app.usage('101')['dm']['used'],0)
+    def test_status_includes_health_for_all_accounts(self):
+        self.sender();d=self.run_async(self.app.status());self.assertEqual(len(d['accounts']),3)
+        self.assertTrue(all('health' in a for a in d['accounts']));self.assertTrue(d['accounts'][0]['health']['connected'])
+
 if __name__=='__main__':unittest.main()
+
 
 
 
