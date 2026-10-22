@@ -13,7 +13,7 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.7')
+app=FastAPI(title='WMM Team',version='3.8')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
 lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
@@ -109,9 +109,21 @@ EXCHANGES={'bingx':'BingX','bitget':'Bitget','bitunix':'Bitunix','blofin':'BloFi
 DEFAULT_YES_PITCH="Nice to meet you @username,\nThis is mark from WMM\n\nI saw the @TOKEN chart on {{exchange}}, candlesticks look broken, we provide a professional trading team for market making, {{exchange}} trading fees are quite high but we make it good in the same daily fee spending budget\n\nWe make the chart most compatible with trading views and other trading signals tools to activate more real traders."
 DEFAULT_YES_DEMO="We can give you a free demo also\nIf you have time we can jump on call and discuss further"
 DEFAULT_NO_REPLY="We can also offer a free demo so you can see how we work before making a decision. Would you be open to a quick call to discuss what could work for your project?"
+TEMPLATE_KEYS=('template','followup_template','yes_pitch_template','yes_demo_template','no_reply_template')
 def settings():
     r=db.execute('select data from settings where id=1').fetchone()
-    return {'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'','yes_pitch_template':DEFAULT_YES_PITCH,'yes_demo_template':DEFAULT_YES_DEMO,'no_reply_template':DEFAULT_NO_REPLY,'auto_yes_enabled':True,'auto_followup_enabled':True,'send_delay_seconds':120,**(json.loads(r[0]) if r else {})}
+    cfg={'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'','yes_pitch_template':DEFAULT_YES_PITCH,'yes_demo_template':DEFAULT_YES_DEMO,'no_reply_template':DEFAULT_NO_REPLY,'auto_yes_enabled':True,'auto_followup_enabled':True,'send_delay_seconds':120,**(json.loads(r[0]) if r else {})}
+    existing=cfg.get('template_variants') or {}
+    cfg['template_variants']={key:(list(existing[key])+['']*5)[:5] if key in existing else [cfg[key],'','','',''] for key in TEMPLATE_KEYS}
+    return cfg
+def choose_template(key,cfg=None,chosen=None):
+    cfg=cfg or settings()
+    choices=[text.strip() for text in cfg['template_variants'][key] if text.strip()]
+    if not choices:raise HTTPException(400,'Add at least one message option for '+key+' in Message templates.')
+    if chosen is not None:
+        if chosen not in choices:raise HTTPException(409,'A selected automatic message option has changed. Reopen the message preview before sending.')
+        return chosen
+    return secrets.choice(choices)
 def pacing_status(principal):
     row=db.execute('select last_attempt_at from send_pacing where principal=?',(principal,)).fetchone()
     # Cover deliveries made before the pacing migration too.
@@ -638,7 +650,7 @@ async def process_auto_followups(limit=1):
                 if not body:
                     contact=db.execute('select data from contacts where id=?',(cid,)).fetchone()
                     if not contact:state='Needs attention';raise HTTPException(409,'Saved recipient is unavailable')
-                    body=personalize_message(settings()['followup_template'],json.loads(contact[0]),token,exchange)
+                    body=personalize_message(choose_template('followup_template'),json.loads(contact[0]),token,exchange)
                     db.execute('update auto_followup_jobs set body=? where root_id=?',(body,root));db.commit()
                 db.execute("update auto_followup_jobs set status='Sending' where root_id=?",(root,));db.commit()
                 await deliver(cid,slot,'dm',body,followup_of=root,request_id='auto-followup:'+root,expected_principal=principal,token_symbol=token,exchange=exchange,automatic_followup=root)
@@ -698,7 +710,7 @@ class Account(BaseModel):account_id:int=Field(default=1,ge=1,le=3)
 class Login(Account):phone:str
 class Verify(Account):phone:str='';code:str='';password:str=''
 class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False
-class Config(BaseModel):template:str='';sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3);token_symbol:str=Field(default='',max_length=33)
+class Config(BaseModel):template:str|None=None;sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3);token_symbol:str=Field(default='',max_length=33)
 class Templates(BaseModel):
     template:str=Field(min_length=1,max_length=4096)
     followup_template:str=Field(min_length=1,max_length=4096)
@@ -707,7 +719,8 @@ class Templates(BaseModel):
     no_reply_template:str|None=Field(default=None,min_length=1,max_length=4096)
     auto_yes_enabled:bool|None=None
     auto_followup_enabled:bool|None=None
-class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None;token_symbol:str|None=Field(default=None,max_length=33);exchange:str=Field(default='',max_length=64);auto_yes:bool=False
+    template_variants:dict[str,list[str]]|None=None
+class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None;token_symbol:str|None=Field(default=None,max_length=33);exchange:str=Field(default='',max_length=64);auto_yes:bool=False;auto_reply_templates:dict[str,str]|None=None
 class SheetSend(BaseModel):id:str
 class Followup(BaseModel):
     token_symbol:str|None=Field(default=None,max_length=33)
@@ -721,7 +734,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.7'},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.8'},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -755,7 +768,7 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
-    return {'version':'3.7','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'contact_import':True}}
+    return {'version':'3.8','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'contact_import':True,'template_variants':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
 WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches')
 def workspace_reset_counts():
@@ -951,15 +964,34 @@ async def scan(body:Scan):
 async def config(body:Config):
     body.token_symbol=normalize_token(body.token_symbol)
     if body.sheet_url and 'docs.google.com/spreadsheets/d/' not in body.sheet_url:raise HTTPException(400,'Paste a Google Sheets URL, not a Google Doc')
-    merged={**settings(),**body.model_dump()}
-    db.execute('insert or replace into settings values(1,?)',(json.dumps(merged),));db.commit();return {'ok':True}
+    async with lock:
+        merged={**settings(),**body.model_dump(exclude_none=True)}
+        if body.template is not None:
+            merged['template_variants']['template'][0]=body.template.strip()
+            merged['template']=next((v for v in merged['template_variants']['template'] if v.strip()),'')
+        db.execute('insert or replace into settings values(1,?)',(json.dumps(merged),));db.commit()
+    return {'ok':True}
 @app.post('/templates',dependencies=[Depends(auth)])
 async def save_templates(body:Templates):
     values={k:(v.strip() if isinstance(v,str) else v) for k,v in body.model_dump(exclude_none=True).items()}
     if any(isinstance(v,str) and not v for v in values.values()):raise HTTPException(400,'Message templates must contain text')
-    merged={**settings(),**values}
-    db.execute('insert or replace into settings values(1,?)',(json.dumps(merged),));db.commit()
-    return {'ok':True,**values}
+    async with lock:
+        cfg=settings();variants=values.pop('template_variants',None)
+        pools=copy.deepcopy(cfg['template_variants'])
+        if variants is not None:
+            if set(variants)!=set(TEMPLATE_KEYS):raise HTTPException(400,'Provide five options for each of the five message types.')
+            for key,options in variants.items():
+                if len(options)!=5 or any(len(text)>4096 for text in options):raise HTTPException(400,'Each message type needs five slots, up to 4,096 characters each.')
+                options=[text.strip() for text in options]
+                if not any(options):raise HTTPException(400,'Keep at least one non-empty option for each message type.')
+                pools[key]=options;values[key]=next(text for text in options if text)
+        else:
+            # Older clients may edit the first option; keep all alternate options.
+            for key in TEMPLATE_KEYS:
+                if key in values:pools[key][0]=values[key]
+        merged={**cfg,**values,'template_variants':pools}
+        db.execute('insert or replace into settings values(1,?)',(json.dumps(merged),));db.commit()
+    return {'ok':True,**values,'template_variants':pools}
 def normalize_token(value):
     symbol=(value or '').strip().lstrip('$')
     if symbol and not re.fullmatch(r'[A-Za-z0-9._-]{1,32}',symbol):raise HTTPException(400,'Use a token symbol of up to 32 letters, numbers, dots, underscores or hyphens')
@@ -984,7 +1016,7 @@ def personalize_message(text,contact,token_symbol='',exchange=''):
     text=text.replace('{{token}}','$'+symbol if symbol else '')
     return re.sub(r'[$@]TOKEN\b',lambda match:'$'+symbol,text)
 
-async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=None,expected_principal=None,token_symbol=None,exchange='',auto_yes=False,automation_job=None,automation_step=0,automatic_followup=None):
+async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=None,expected_principal=None,token_symbol=None,exchange='',auto_yes=False,automation_job=None,automation_step=0,automatic_followup=None,auto_reply_templates=None):
     async with lock:
         c=await ready(slot);principal=await identify(slot,c)
         row=db.execute('select data from contacts where id=?',(cid,)).fetchone()
@@ -1008,7 +1040,7 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             field='group_id' if kind=='group' else 'user_id'
             contact[field]=str(utils.get_peer_id(resolved) if kind=='group' else resolved.id)
             contact['import_unresolved']=False;save(contact);resolved_peer=resolved
-        text=(message if message is not None else settings()['template']).strip()
+        text=(message if message is not None else choose_template('template')).strip()
         if not text:raise HTTPException(400,'Write your message before sending')
         symbol=normalize_token(settings().get('token_symbol','') if token_symbol is None else token_symbol)
         exchange=normalize_exchange(exchange)
@@ -1025,6 +1057,9 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if auto_yes:
             if kind!='dm' or followup_of:raise HTTPException(400,'Automatic replies can be enabled only on a new direct message')
             if not exchange or not symbol:raise HTTPException(400,'Select the exchange and enter the token to enable automatic replies')
+            if auto_reply_templates is not None and set(auto_reply_templates)!={'yes_pitch_template','yes_demo_template','no_reply_template'}:raise HTTPException(400,'Provide all three automatic reply previews.')
+            for key in ('yes_pitch_template','yes_demo_template','no_reply_template'):
+                yes_cfg[key]=choose_template(key,yes_cfg,auto_reply_templates[key] if auto_reply_templates else None)
             personalize_message(yes_cfg['yes_pitch_template'],contact,symbol,exchange)
             personalize_message(yes_cfg['yes_demo_template'],contact,symbol,exchange)
             personalize_message(yes_cfg['no_reply_template'],contact,symbol,exchange)
@@ -1091,7 +1126,7 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             if auto_yes:arm_auto_yes(principal,target,slot,delivery_id,cid,exchange,symbol,yes_cfg['yes_pitch_template'],yes_cfg['yes_demo_template'],yes_cfg['no_reply_template'])
         return {'status':'Sent','id':cid,'account_id':slot,'kind':kind,'usage':usage(principal)}
 @app.post('/send',dependencies=[Depends(auth)])
-async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message,token_symbol=body.token_symbol,exchange=body.exchange,auto_yes=body.auto_yes)
+async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message,token_symbol=body.token_symbol,exchange=body.exchange,auto_yes=body.auto_yes,auto_reply_templates=body.auto_reply_templates)
 @app.post('/follow-up',dependencies=[Depends(auth)])
 async def follow_up(body:Followup):
     parent=db.execute('select principal,slot,kind,contact_id,status from outbox where id=?',(body.delivery_id,)).fetchone()

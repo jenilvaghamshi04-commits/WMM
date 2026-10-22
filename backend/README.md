@@ -72,3 +72,11 @@ Authenticated endpoints:
 - `POST /contacts/import/confirm` with `batch_id` to add valid unique contacts. Rechecks duplicates at confirmation and consumes the batch once.
 
 A local cooldown responds with HTTP 429 and `detail.code=send_cooldown`, `retry_after`, and `next_available_at`; this is the only send response the dashboard waits and retries automatically. Telegram FloodWait/PeerFlood, daily caps, uncertain delivery, and other errors stop the action. Every send path shares the persisted cooldown keyed to Telegram identity. Reset actions preserve cooldowns. Existing Render free ephemeral-storage limits still apply; keep `DATA_DIR` durable for restart-safe records across host replacement.
+
+## v3.8: five template options per type
+
+`POST /templates` accepts `template_variants`, a dictionary using the existing five template keys (`template`, `followup_template`, `yes_pitch_template`, `yes_demo_template`, `no_reply_template`). Each key has exactly five strings, up to 4,096 characters per slot. Blank slots are skipped; every type needs one non-empty option. Legacy scalar fields remain supported and reflect the first non-empty slot. Legacy edits change option 1 while preserving alternate options. `/settings` Compose edits likewise preserve options 2–5.
+
+`/status` includes the normalized pools and `features.template_variants`. A server-side implicit initial send (including `/sheet-send`) randomly picks from the initial pool. Reviewed manual sends post their chosen text explicitly so the preview is exact. New automatic enrollments independently choose a yes pitch, call invitation and no offer; the dashboard sends `auto_reply_templates` containing those exact previews, and the server verifies they are still configured options before enrolling. These concrete texts are then stored with the conversation. Pending or completed old enrollments stay unchanged. Automatic follow-up workers persist one selected, personalized follow-up body before attempting delivery, so waiting/restarting never rerolls it.
+
+Random selection does not alter sender identity, delay settings, quotas, opt-out handling, duplicate checks or once-only completion. Separate choices may select the same option consecutively. All activation still requires deploying this commit on the Render gateway; start/build commands are unchanged.
