@@ -15,7 +15,7 @@ API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
 app=FastAPI(title='WMM Team',version='3.3')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
-lock=asyncio.Lock();phone_hash={};clients={};startup_errors={};reply_task=None;folder_task=None
+lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;folder_task=None
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
 db.execute('create table if not exists contacts(id text primary key, data text)')
 db.execute('create table if not exists settings(id integer primary key, data text)')
@@ -462,7 +462,7 @@ async def rpc_error(request,exc):
     return JSONResponse(status_code=400,content={'detail':str(exc)})
 class Account(BaseModel):account_id:int=Field(default=1,ge=1,le=3)
 class Login(Account):phone:str
-class Verify(Account):phone:str;code:str='';password:str=''
+class Verify(Account):phone:str='';code:str='';password:str=''
 class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False
 class Config(BaseModel):template:str='';sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3);token_symbol:str=Field(default='',max_length=33)
 class Templates(BaseModel):
@@ -495,7 +495,7 @@ async def configure_telegram_api(body:TelegramAPI):
             await candidate.disconnect()
             raise HTTPException(502,'Could not reach Telegram. API settings were not saved; try again later.')
         db.execute('insert or replace into telegram_api values(?,?,?)',(slot,body.api_id,value));db.commit()
-        clients[slot]=attach_reply_listener(candidate,slot);startup_errors.pop(slot,None)
+        clients[slot]=attach_reply_listener(candidate,slot);login_pending.pop(slot,None);startup_errors.pop(slot,None)
     return {'api_configured':True,'account_id':slot}
 @app.get('/status',dependencies=[Depends(auth)])
 async def status():
@@ -513,8 +513,8 @@ async def status():
             if row:principal,label,phone,blocked=row
         u=usage(principal)
         sent=sent_in_current_quota(principal)
-        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,''))})
-    return {'version':'3.3','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True}}
+        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),**login_progress(slot)})
+    return {'version':'3.3','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True}}
 @app.post('/reset-daily-limits',dependencies=[Depends(auth)])
 async def reset_daily_limits(body:ResetQuota):
     async with lock:
@@ -534,30 +534,78 @@ async def reset_daily_limits(body:ResetQuota):
                 db.execute('insert into quota_resets values(?,?,?,?,?,?,?,?,?)',(uuid.uuid4().hex,principal,body.account_id,kind,date,floor,stamp(),before[kind]['used'],body.request_id))
         return {'ok':True,'account_id':body.account_id,'scope':body.scope,'already_applied':False,'usage':usage(principal)}
 
+LOGIN_AUTH_ERRORS=(errors.AuthKeyUnregisteredError,errors.AuthKeyInvalidError,errors.SessionRevokedError,errors.SessionExpiredError,errors.AuthRestartError)
+def normalize_login_phone(phone):
+    value=re.sub(r'[\s().-]','',phone)
+    if not re.fullmatch(r'\+[1-9][0-9]{6,14}',value):raise HTTPException(400,'Enter your phone number with + and country code, for example +91…')
+    return value
+def login_progress(slot):
+    state=login_pending.get(slot)
+    if state and state['expires_at']<=stamp():login_pending.pop(slot,None);state=None
+    return {'login_step':('password' if state['password_required'] else 'code') if state else 'phone','login_phone_hint':('••••'+state['phone'][-4:]) if state else ''}
+async def renew_login_client(slot,old):
+    # Reset only a rejected Telegram transport key for this slot; retain app records and API settings.
+    await old.disconnect()
+    session=getattr(old,'session',None)
+    if session is None:raise HTTPException(409,'This Telegram login expired. Request a new login code to start again.')
+    session.auth_key=None;session.save();session.close()
+    replacement=make_client(slot)
+    if replacement is None:raise HTTPException(409,'Configure the Telegram API for this account first.')
+    clients[slot]=replacement;await replacement.connect();return replacement
 @app.post('/login',dependencies=[Depends(auth)])
 async def login(body:Login):
+    phone=normalize_login_phone(body.phone)
     async with lock:
         c=require_client(body.account_id)
         if not c.is_connected():await c.connect()
-        r=await c.send_code_request(body.phone);phone_hash[(body.account_id,body.phone)]=r.phone_code_hash
-    return {'ok':True,'account_id':body.account_id}
+        if await c.is_user_authorized():
+            await identify(body.account_id,c);login_pending.pop(body.account_id,None)
+            return {'authorized':True,'account_id':body.account_id}
+        login_pending.pop(body.account_id,None)
+        try:
+            try:r=await c.send_code_request(phone)
+            except LOGIN_AUTH_ERRORS:
+                c=await renew_login_client(body.account_id,c);r=await c.send_code_request(phone)
+        except LOGIN_AUTH_ERRORS:raise HTTPException(409,'Telegram could not start this login. Request a new code for this account again.')
+        except errors.PhoneNumberInvalidError:raise HTTPException(400,'Telegram rejected this phone number. Check the +country code and number.')
+        if not getattr(r,'phone_code_hash',None):raise HTTPException(409,'Telegram did not start a code login. Request a new login code.')
+        login_pending[body.account_id]={'phone':phone,'hash':r.phone_code_hash,'password_required':False,'expires_at':(datetime.now(timezone.utc)+timedelta(minutes=10)).isoformat()}
+    return {'ok':True,'account_id':body.account_id,'login_step':'code'}
 @app.post('/verify',dependencies=[Depends(auth)])
 async def verify(body:Verify):
     async with lock:
         c=require_client(body.account_id)
         if not c.is_connected():await c.connect()
+        if await c.is_user_authorized():
+            await identify(body.account_id,c);login_pending.pop(body.account_id,None)
+            return {'authorized':True,'account_id':body.account_id}
+        login_progress(body.account_id);state=login_pending.get(body.account_id)
+        if not state:raise HTTPException(409,'Request a new login code for this account first. Pending logins expire after a restart or timeout.')
+        if body.phone and normalize_login_phone(body.phone)!=state['phone']:raise HTTPException(409,'This login code belongs to another phone number. Request a new code for the number shown.')
         try:
-            if body.password:await c.sign_in(password=body.password)
-            else:await c.sign_in(body.phone,body.code,phone_code_hash=phone_hash.get((body.account_id,body.phone)))
-        except errors.SessionPasswordNeededError:return {'password_required':True}
+            if not state['password_required']:
+                code=re.sub(r'[\s-]','',body.code)
+                if not code:raise HTTPException(400,'Enter the Telegram login code first. The two-step password is checked after the code.')
+                try:await c.sign_in(state['phone'],code,phone_code_hash=state['hash'])
+                except errors.SessionPasswordNeededError:state['password_required']=True
+            if state['password_required']:
+                if not body.password:return {'password_required':True,'account_id':body.account_id,'login_step':'password'}
+                await c.sign_in(password=body.password)
+        except (errors.PhoneCodeExpiredError,errors.PhoneCodeHashEmptyError):
+            login_pending.pop(body.account_id,None);raise HTTPException(409,'This Telegram login code expired. Request a new login code.')
+        except (errors.PhoneCodeInvalidError,errors.PhoneCodeEmptyError):raise HTTPException(400,'That Telegram login code is incorrect. Check the latest code and try again.')
+        except errors.PasswordHashInvalidError:raise HTTPException(400,'The Telegram two-step password is incorrect. Try your Telegram account password again.')
+        except LOGIN_AUTH_ERRORS:
+            login_pending.pop(body.account_id,None);raise HTTPException(409,'This Telegram login session expired. Request a new login code, verify the code first, then enter the two-step password only when asked.')
         try:await identify(body.account_id,c)
         except HTTPException:
-            await c.log_out();raise
+            login_pending.pop(body.account_id,None);await c.log_out();raise
+        login_pending.pop(body.account_id,None)
     return {'authorized':True,'account_id':body.account_id}
 @app.post('/logout',dependencies=[Depends(auth)])
 async def logout(body:Account):
     async with lock:
-        c=require_client(body.account_id);await c.log_out()
+        c=require_client(body.account_id);login_pending.pop(body.account_id,None);await c.log_out()
         clients.pop(body.account_id,None)
         replacement=make_client(body.account_id)
         if replacement:clients[body.account_id]=replacement;await replacement.connect()
