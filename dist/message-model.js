@@ -1,5 +1,6 @@
 (function(root){
   const introduction="Hey @username! Hope you're doing well.\n\nI'm Mark from Wallstreet Market Maker (WMM).\n\nI recently came across $TOKEN and thought it would be worth connecting.\n\nWe work with crypto projects to improve trading liquidity, maintain healthier order books, and manage liquidity across exchanges.\n\nI believe there could be a good opportunity for us to work together.\n\nAre you the right person to discuss this with?";
+  const followup="Hey, just following up on my previous message. Is improving liquidity and order-book depth something your team is currently exploring?\nHappy to share how WMM could help. If someone else handles this, could you point me their way?";
   function type(contact){return contact.kind||'dm'}
   function summarize(rows){
     rows=rows.slice().sort((a,b)=>new Date(b.at)-new Date(a.at));
@@ -22,5 +23,12 @@
     return String(text||'').replaceAll('@{{username}}',handle).replaceAll('{{username}}',handle).replaceAll('@username',handle).replaceAll('{{name}}',contact.name||'').replaceAll('{{role}}',contact.role||'').replaceAll('{{group}}',contact.group||'').replaceAll('{{token}}',symbol?'$'+symbol:'$TOKEN').replace(/\$TOKEN\b/g,symbol?'$'+symbol:'$TOKEN');
   }
   function status(summary){const d=summary.latest;if(!d)return 'Not sent';if(d.status==='Sending')return 'Sending';if(d.status==='Uncertain')return 'Delivery needs review';if(d.followup_of)return d.status==='Sent'?'Follow-up sent':'Follow-up '+d.status.toLowerCase();return d.status==='Sent'?'Message sent':d.status}
-  root.WMMMessageModel={type,conversation,conversations,personalize,status,introduction,normalizeToken,requiresToken};
+  function deliveryStates(summary){
+    function state(isFollowup){
+      const rows=summary.rows.filter(d=>!!d.followup_of===isFollowup),confirmed=rows.some(d=>d.status==='Sent'),latest=rows[0];
+      return {label:confirmed?'Sent':'Not sent',sent:confirmed,detail:latest&&latest.status!=='Sent'?latest.status==='Uncertain'?'Delivery uncertain · check Telegram':latest.status==='Sending'?'Sending · awaiting confirmation':latest.status+(latest.error?' · '+latest.error:''):''};
+    }
+    return {message:state(false),followup:state(true)};
+  }
+  root.WMMMessageModel={type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken};
 })(typeof window==='undefined'?globalThis:window);

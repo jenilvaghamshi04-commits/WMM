@@ -81,9 +81,10 @@ async def dashboard_logout(authorization:str=Header(default='')):
 
 def stamp():return datetime.now(timezone.utc).isoformat()
 def today():return datetime.now(TZ).date().isoformat()
+DEFAULT_FOLLOWUP="Hey, just following up on my previous message. Is improving liquidity and order-book depth something your team is currently exploring?\nHappy to share how WMM could help. If someone else handles this, could you point me their way?"
 def settings():
     r=db.execute('select data from settings where id=1').fetchone()
-    return {'template':'','sheet_url':'','sender_account':1,'token_symbol':'',**(json.loads(r[0]) if r else {})}
+    return {'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'',**(json.loads(r[0]) if r else {})}
 def contacts():return [c for r in db.execute('select data from contacts') if not (c:=json.loads(r[0])).get('is_bot',False)]
 def save(c):db.execute('insert or replace into contacts values(?,?)',(c['id'],json.dumps(c)));db.commit()
 def session_path(slot):return str(ROOT/('telegram' if slot==1 else f'telegram_{slot}'))
@@ -196,6 +197,9 @@ class Login(Account):phone:str
 class Verify(Account):phone:str;code:str='';password:str=''
 class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False
 class Config(BaseModel):template:str='';sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3);token_symbol:str=Field(default='',max_length=33)
+class Templates(BaseModel):
+    template:str=Field(min_length=1,max_length=4096)
+    followup_template:str=Field(min_length=1,max_length=4096)
 class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None;token_symbol:str|None=Field(default=None,max_length=33)
 class SheetSend(BaseModel):id:str
 class Followup(BaseModel):
@@ -242,7 +246,7 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,''))})
-    return {'version':'3.1','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True}}
+    return {'version':'3.1','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True}}
 @app.post('/reset-daily-limits',dependencies=[Depends(auth)])
 async def reset_daily_limits(body:ResetQuota):
     async with lock:
@@ -364,7 +368,15 @@ async def scan(body:Scan):
 async def config(body:Config):
     body.token_symbol=normalize_token(body.token_symbol)
     if body.sheet_url and 'docs.google.com/spreadsheets/d/' not in body.sheet_url:raise HTTPException(400,'Paste a Google Sheets URL, not a Google Doc')
-    db.execute('insert or replace into settings values(1,?)',(body.model_dump_json(),));db.commit();return {'ok':True}
+    merged={**settings(),**body.model_dump()}
+    db.execute('insert or replace into settings values(1,?)',(json.dumps(merged),));db.commit();return {'ok':True}
+@app.post('/templates',dependencies=[Depends(auth)])
+async def save_templates(body:Templates):
+    values={k:v.strip() for k,v in body.model_dump().items()}
+    if not all(values.values()):raise HTTPException(400,'Both message templates must contain text')
+    merged={**settings(),**values}
+    db.execute('insert or replace into settings values(1,?)',(json.dumps(merged),));db.commit()
+    return {'ok':True,**values}
 def normalize_token(value):
     symbol=(value or '').strip().lstrip('$')
     if symbol and not re.fullmatch(r'[A-Za-z0-9._-]{1,32}',symbol):raise HTTPException(400,'Use a token symbol of up to 32 letters, numbers, dots, underscores or hyphens')

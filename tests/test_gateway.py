@@ -34,6 +34,23 @@ class GatewayTests(unittest.TestCase):
     def setup_template(self):self.run_async(self.app.config(self.app.Config(template='Hello {{name}} in {{group}}')))
     def test_three_empty_slots_no_secrets(self):
         d=self.run_async(self.app.status());self.assertEqual(len(d['accounts']),3);self.assertFalse(d['authorized']);self.assertNotIn('api_hash',json.dumps(d));self.assertEqual(d['quota_timezone'],'Asia/Kolkata')
+    def test_templates_preserve_config_and_survive_reload(self):
+        self.run_async(self.app.config(self.app.Config(template='Old initial',sheet_url='https://docs.google.com/spreadsheets/d/test',sender_account=2,token_symbol='LF')))
+        self.run_async(self.app.save_templates(self.app.Templates(template=' New @username $TOKEN ',followup_template=' Follow-up {{name}} ')))
+        cfg=self.app.settings();self.assertEqual(cfg['template'],'New @username $TOKEN');self.assertEqual(cfg['followup_template'],'Follow-up {{name}}');self.assertEqual(cfg['sender_account'],2);self.assertEqual(cfg['token_symbol'],'LF');self.assertIn('spreadsheets',cfg['sheet_url'])
+        self.app.db.close();self.load();self.assertEqual(self.app.settings()['followup_template'],'Follow-up {{name}}')
+        self.run_async(self.app.config(self.app.Config(template='Compose edit')))
+        self.assertEqual(self.app.settings()['followup_template'],'Follow-up {{name}}')
+    def test_default_followup_and_blank_template_rejected(self):
+        self.assertTrue(self.app.settings()['followup_template'].startswith('Hey, just following up on my previous message.'))
+        with self.assertRaises(HTTPException):self.run_async(self.app.save_templates(self.app.Templates(template='   ',followup_template='Hello')))
+        self.assertEqual(self.app.settings()['template'],'')
+    def test_edited_template_sends_personalized_text_and_history_is_preserved(self):
+        sender=self.sender();cid=self.contact(999)
+        self.run_async(self.app.save_templates(self.app.Templates(template='Hi @username about $TOKEN',followup_template='Checking in {{name}}')))
+        self.run_async(self.app.deliver(cid,1,token_symbol='LF'))
+        self.run_async(self.app.save_templates(self.app.Templates(template='Changed',followup_template='Changed too')))
+        self.assertEqual(sender.sent[0][1],'Hi Person 999 about $LF');self.assertEqual(self.app.records()[0]['message'],'Hi Person 999 about $LF')
     def test_auth_and_missing_account(self):
         with self.assertRaises(HTTPException):self.app.auth('Bearer wrong')
         self.app.auth('Bearer test-secret')
