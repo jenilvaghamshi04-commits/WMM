@@ -13,7 +13,7 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.4')
+app=FastAPI(title='WMM Team',version='3.6')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
 lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
@@ -30,6 +30,7 @@ db.execute('create table if not exists message_details(delivery_id text primary 
 if 'token_symbol' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column token_symbol text not null default ''")
 db.execute('create table if not exists followup_requests(request_id text primary key, delivery_id text, parent_id text, message_hash text)')
 db.execute('create table if not exists meta(key text primary key, value text)')
+db.execute('create table if not exists workspace_reset_requests(request_id text primary key,result text)')
 if 'telegram_message_id' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column telegram_message_id integer not null default 0")
 db.execute("create table if not exists folder_routes(principal text, target text, slot integer, desired text, applied text not null default '', revision integer not null default 1, applied_revision integer not null default 0, queued_at text, checked_at text not null default '', error text not null default '', next_attempt_at text not null default '', primary key(principal,target))")
 db.execute('create table if not exists folder_pauses(principal text primary key, until_at text, error text)')
@@ -286,6 +287,7 @@ async def update_lead(body:LeadUpdate):
 
 async def sync_reply_pair(principal,target,slot,first_at):
     async with lock:
+        if not db.execute("select 1 from outbox where principal=? and target=? and kind='dm' and status='Sent'",(principal,target)).fetchone():return {'target':target,'ok':True,'complete':True,'skipped':True}
         checked=stamp();row=db.execute('select cursor from reply_sync where principal=? and target=?',(principal,target)).fetchone();cursor=row[0] if row else 0
         try:
             client=None
@@ -689,7 +691,7 @@ class ResetQuota(Account):
     request_id:str=Field(min_length=8,max_length=128)
 class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
-async def health():return {'service':'teamradar','ok':True,'version':'3.5'}
+async def health():return {'service':'teamradar','ok':True,'version':'3.6'}
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -723,7 +725,33 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),**login_progress(slot)})
-    return {'version':'3.5','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True}}
+    return {'version':'3.6','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True}}
+# Workspace reset never disconnects Telegram or changes message templates.
+WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs')
+def workspace_reset_counts():
+    count=lambda table:db.execute('select count(*) from '+table).fetchone()[0]
+    return {'contacts':count('contacts'),'messages':count('outbox'),'replies':count('replies'),'leads':len(lead_records()),'automations':count('auto_yes_jobs')+count('auto_yes_enrollments')+count('auto_followup_jobs')}
+class WorkspaceReset(BaseModel):
+    confirmation:Literal['RESET DATA']
+    request_id:str=Field(min_length=8,max_length=128)
+@app.get('/workspace/reset-preview',dependencies=[Depends(auth)])
+async def preview_workspace_reset():
+    async with lock:return {'counts':workspace_reset_counts(),'preserves':['Telegram accounts','API credentials','message templates','workspace login','Telegram-imposed waits']}
+@app.post('/workspace/reset',dependencies=[Depends(auth)])
+async def reset_workspace(body:WorkspaceReset):
+    # Wait for existing send/check jobs, then prevent a stale job from writing after reset.
+    async with auto_yes_lock:
+        async with auto_followup_lock:
+            async with lock:
+                previous=db.execute('select result from workspace_reset_requests where request_id=?',(body.request_id,)).fetchone()
+                if previous:return {**json.loads(previous[0]),'already_reset':True}
+                result={'ok':True,'counts':workspace_reset_counts(),'at':stamp()}
+                with db:
+                    for table in WORKSPACE_DATA_TABLES:db.execute('delete from '+table)
+                    db.execute("insert or replace into meta values('outbox_migrated','1')")
+                    db.execute('insert into workspace_reset_requests values(?,?)',(body.request_id,json.dumps(result)))
+                return result
+
 @app.post('/reset-daily-limits',dependencies=[Depends(auth)])
 async def reset_daily_limits(body:ResetQuota):
     async with lock:
