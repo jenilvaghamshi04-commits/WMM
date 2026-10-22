@@ -18,3 +18,5 @@ API ID and API Hash can now be entered directly in Connections after connecting 
 The gateway download is a self-contained copy: app.py can serve its included dist/ folder. Run `python -m uvicorn app:app` from the extracted folder and install `requirements.txt`. For the GitHub repository layout use `python -m uvicorn backend.app:app` instead.
 
 V2 supports three independent slots. Select Account 1, 2 or 3 in Connections before entering API and phone details. In Compose choose the sender and DM/group mode, select recipients and click Send message. Limits are 15 DM attempts and 30 group attempts per Telegram identity per IST day. The 10/day target is manual progress, not a scheduler. Sheet checkboxes use the saved template and sender. Preserve DATA_DIR to retain limits and Telegram sessions.
+
+WMM Team v3 adds dashboard login: admin / DASHBOARD_KEY by default, or configure DASHBOARD_USERNAME and DASHBOARD_PASSWORD. Saved data and Sent messages are separate app pages. Follow-ups use the original sender, count against its daily limits and remain in delivery history. Bot admins are excluded.

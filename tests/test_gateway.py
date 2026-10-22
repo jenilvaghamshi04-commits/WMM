@@ -227,6 +227,87 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(self.app.usage('101')['dm']['used'],0);await self.app.deliver(self.contact(3));self.assertEqual(self.app.usage('101')['dm']['used'],1)
         self.run_async(run())
 
+    def dashboard_request(self):
+        from fastapi import Request
+        return Request({'type':'http','client':('test-client',1234),'headers':[]})
+    def test_dashboard_login_token_hash_and_logout(self):
+        async def run():
+            with patch.object(self.app,'DASHBOARD_USERNAME','admin'),patch.object(self.app,'DASHBOARD_PASSWORD','test-secret'):
+                response=await self.app.dashboard_login(self.app.DashboardLogin(username='admin',password='test-secret'),self.dashboard_request())
+            token=response['access_token'];self.assertEqual(self.app.auth('Bearer '+token),'admin')
+            stored=self.app.db.execute('select token_hash from dashboard_sessions').fetchone()[0];self.assertNotEqual(stored,token)
+            await self.app.dashboard_logout('Bearer '+token)
+            with self.assertRaises(HTTPException):self.app.auth('Bearer '+token)
+        self.run_async(run())
+    def test_dashboard_bad_login_rate_limit(self):
+        async def run():
+            for _ in range(5):
+                with self.assertRaises(HTTPException) as e:await self.app.dashboard_login(self.app.DashboardLogin(username='wrong',password='wrong'),self.dashboard_request())
+                self.assertEqual(e.exception.status_code,401)
+            with self.assertRaises(HTTPException) as e:await self.app.dashboard_login(self.app.DashboardLogin(username='wrong',password='wrong'),self.dashboard_request())
+            self.assertEqual(e.exception.status_code,429)
+        self.run_async(run())
+    def test_expired_dashboard_session_rejected(self):
+        self.app.db.execute('insert into dashboard_sessions values(?,?,?)',('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','admin','2000-01-01T00:00:00+00:00'));self.app.db.commit()
+        with self.assertRaises(HTTPException):self.app.auth('Bearer ')
+    def test_bot_admin_is_not_collected(self):
+        c=self.scan_client()
+        async def bots(*args,**kwargs):return [SimpleNamespace(id=99,first_name='Bot Admin',last_name='',username='bot_admin',bot=True,deleted=False,participant=SimpleNamespace(rank='Admin'))]
+        c.get_participants=bots
+        result=self.run_async(self.app.scan(self.app.Scan(link='@test_group')))
+        self.assertEqual(result['count'],0);self.assertFalse(any(p.get('user_id')=='99' for p in self.app.contacts()))
+    def test_known_bot_is_not_messaged_or_listed(self):
+        c=self.sender();self.setup_template();cid=self.contact(1)
+        saved=json.loads(self.app.db.execute('select data from contacts where id=?',(cid,)).fetchone()[0]);saved['is_bot']=True;self.app.save(saved)
+        self.assertFalse(any(p['id']==cid for p in self.app.contacts()))
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver(cid))
+        self.assertEqual(e.exception.status_code,400);self.assertEqual(c.sent,[])
+    def test_sent_records_include_message_and_recipient(self):
+        self.sender();self.setup_template();cid=self.contact(1);self.run_async(self.app.deliver(cid))
+        record=self.app.records()[0]
+        self.assertEqual(record['recipient_name'],'Person 1');self.assertEqual(record['message'],'Hello Person 1 in Group');self.assertEqual(record['sender_label'],'Sender 101')
+    def test_followup_uses_original_account_and_keeps_both_records(self):
+        other=self.sender(1);sender=self.sender(2);self.setup_template();cid=self.contact(1)
+        async def run():
+            await self.app.deliver(cid,2)
+            original=self.app.records()[0]['delivery_id']
+            r=await self.app.follow_up(self.app.Followup(delivery_id=original,message='Following up, {{name}}',request_id='follow-up-001'))
+            self.assertEqual(r['account_id'],2);self.assertEqual(len(sender.sent),2);self.assertEqual(other.sent,[])
+            records=self.app.records();self.assertEqual(len(records),2);self.assertEqual(records[0]['followup_of'],original);self.assertEqual(records[0]['message'],'Following up, Person 1')
+        self.run_async(run())
+    def test_followup_retry_does_not_send_twice(self):
+        c=self.sender();self.setup_template()
+        async def run():
+            await self.app.deliver(self.contact(1));original=self.app.records()[0]['delivery_id']
+            body=self.app.Followup(delivery_id=original,message='Checking in with you.',request_id='repeat-followup-001')
+            await self.app.follow_up(body);r=await self.app.follow_up(body)
+            self.assertTrue(r['already_sent']);self.assertEqual(len(c.sent),2);self.assertEqual(self.app.usage('101')['dm']['used'],2)
+        self.run_async(run())
+    def test_followup_requires_original_telegram_identity(self):
+        self.sender(user=555);self.setup_template()
+        async def run():
+            await self.app.deliver(self.contact(1));original=self.app.records()[0]['delivery_id'];new=self.sender(user=777)
+            with self.assertRaises(HTTPException) as e:await self.app.follow_up(self.app.Followup(delivery_id=original,message='Hello again.',request_id='wrong-sender-001'))
+            self.assertEqual(e.exception.status_code,409);self.assertEqual(new.sent,[])
+        self.run_async(run())
+    def test_followup_respects_daily_cap(self):
+        self.sender();self.setup_template()
+        async def run():
+            for n in range(15):await self.app.deliver(self.contact(n))
+            original=self.app.records()[-1]['delivery_id']
+            with self.assertRaises(HTTPException) as e:await self.app.follow_up(self.app.Followup(delivery_id=original,message='Following up.',request_id='cap-followup-001'))
+            self.assertEqual(e.exception.status_code,429)
+        self.run_async(run())
+    def test_followup_rejects_unconfirmed_delivery(self):
+        c=self.sender();c.fail=RuntimeError('timeout');self.setup_template()
+        async def run():
+            with self.assertRaises(HTTPException):await self.app.deliver(self.contact(1))
+            original=self.app.records()[0]['delivery_id']
+            with self.assertRaises(HTTPException) as e:await self.app.follow_up(self.app.Followup(delivery_id=original,message='Hello again.',request_id='uncertain-followup-001'))
+            self.assertEqual(e.exception.status_code,409)
+        self.run_async(run())
+
 if __name__=='__main__':unittest.main()
+
 
 

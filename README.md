@@ -1,4 +1,4 @@
-# WMM TeamRadar
+# WMM Team
 
 Private Telegram team discovery and selected outreach dashboard.
 
@@ -12,7 +12,7 @@ The repository is a complete Python app: `backend/app.py` serves both the API an
 - Start: `python -m uvicorn backend.app:app --host 0.0.0.0 --port ${PORT:-8000}`
 - Required environment: `DASHBOARD_KEY` (use a long random secret).
 - Optional: `SITE_ORIGIN` (the ChatGPT dashboard origin), `DATA_DIR` (private persistent disk).
-- Open the app, choose **Add API → Connections**, enter the deployed gateway URL and dashboard key, then connect.
+- Open the app, choose **Log in → Connections**, enter the deployed gateway URL and dashboard key, then connect.
 - Add your **Telegram API ID and API Hash** directly in Connections. Get these from https://my.telegram.org. Then request a phone login code and complete Telegram login. Do not publish these secrets in GitHub or send login codes through chat.
 - Alternatively set TELEGRAM_API_ID and TELEGRAM_API_HASH on the server before startup.
 
@@ -62,3 +62,13 @@ Each account card has **Reset limits**. Choose DMs, group messages, or both in t
 ## Live workspace display
 
 The dashboard contains no sample contacts or demo labels. Three real account slots are available; each shows Not connected until Telegram login succeeds. Only the connected gateway supplies contacts, delivery history and usage. Offline counters are marked unavailable, and messaging requires an authorized selected account.
+
+## WMM Team login, saved data and follow-ups (v3)
+
+- The app is branded WMM Team and includes a native SVG favicon. Its existing hosted URL and Google Sheet tab name `TeamRadar` remain compatible.
+- Log in using the deployed server URL, username `admin`, and your existing DASHBOARD_KEY. Optionally set DASHBOARD_USERNAME and DASHBOARD_PASSWORD in your hosting environment to use a different login. No password is committed to source control. Dashboard login is separate from the three Telegram logins.
+- The server issues a 12-hour bearer session; only its SHA-256 hash is stored. Passwords and tokens are not saved in browser storage. Log out revokes the session without disconnecting Telegram. Failed logins are rate-limited. The original DASHBOARD_KEY remains supported for the Sheet trigger and existing integrations.
+- **Find team** scans groups and composes messages. **Saved data** stores and lists real contacts/groups. Choose recipients there, then return to Compose. Bot admins are skipped during scanning and flagged bots cannot be messaged.
+- **Sent messages** shows recipient, username, original sender account, message text, delivery time and status. New sends store these details durably. Earlier records are preserved; their message text cannot be reconstructed and is labeled unavailable.
+- A **Send follow-up** button appears for confirmed sent records. It sends the custom follow-up from the original Telegram identity, checks its current quota and Telegram restrictions, and records a linked delivery. Swapping another identity into the old account slot does not authorize it to follow up. Repeated requests with the same ID do not send twice. Identical previously sent text is blocked; uncertain deliveries need review. Follow-ups are manual, not scheduled.
+- Deploy the latest GitHub commit on Render before using the new login endpoint. A persistent DATA_DIR is required to keep contacts, history, sessions and quotas across Render restarts.
