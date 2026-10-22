@@ -1,0 +1,2 @@
+# Support Render's default build command from the repository root.
+-r backend/requirements.txt
