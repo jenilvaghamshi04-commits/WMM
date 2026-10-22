@@ -78,3 +78,21 @@ class FolderTests(unittest.TestCase):
         self.send();self.reply();self.app.db.execute('delete from folder_routes');self.app.db.commit();self.app.seed_folder_routes();self.assertEqual(self.route()['desired'],'🟡');self.sync();calls=self.client.calls;self.app.seed_folder_routes();self.sync();self.assertEqual(self.client.calls,calls)
     def test_duplicate_reply_events_do_not_requeue_synced_folder(self):
         self.send();self.reply();self.sync();calls=self.client.calls;self.assertFalse(self.reply());self.sync();self.assertEqual(self.client.calls,calls)
+    def test_yes_stays_yellow_after_both_automatic_messages(self):
+        self.run_async(self.app.deliver('dm:7',message='Hi about $TOKEN',token_symbol='ABC',exchange='mexc',auto_yes=True))
+        self.app.record_reply('101','7',1,SimpleNamespace(id=102,date=datetime.now(timezone.utc)+timedelta(seconds=1),out=False,raw_text='yeh'))
+        self.assertEqual(self.route()['desired'],'🟡');self.run_async(self.app.process_auto_yes());self.assertEqual(len(self.client.sent),3);self.assertEqual(self.route()['desired'],'🟡');self.sync();self.assertEqual(self.route()['applied'],'🟡');self.assertEqual(self.folder('🟡').include_peers[0].user_id,7)
+        self.assertEqual(self.app.usage('101')['dm']['used'],1)
+    def test_yes_stays_yellow_after_later_manual_message(self):
+        did=self.send();self.app.record_reply('101','7',1,SimpleNamespace(id=102,date=datetime.now(timezone.utc)+timedelta(seconds=1),out=False,raw_text='Yes!'));self.client.next_message=200
+        self.run_async(self.app.follow_up(self.app.Followup(delivery_id=did,message='Thanks, sharing details',request_id='positive-manual-001')));self.assertEqual(self.route()['desired'],'🟡')
+    def test_existing_positive_route_repaired_once_without_message_send(self):
+        self.send();self.app.record_reply('101','7',1,SimpleNamespace(id=102,date=datetime.now(timezone.utc)+timedelta(seconds=1),out=False,raw_text='yes'))
+        self.app.db.execute("update folder_routes set desired='🔵',applied='🔵',applied_revision=revision");self.app.db.commit();self.app.seed_folder_routes();self.assertEqual(self.route()['desired'],'🟡');self.sync();calls=self.client.calls;self.app.seed_folder_routes();self.sync();self.assertEqual(self.client.calls,calls);self.assertEqual(len(self.client.sent),1)
+    def test_backfilled_yes_older_than_latest_outgoing_still_routes_yellow(self):
+        did=self.send();self.client.next_message=200;self.run_async(self.app.follow_up(self.app.Followup(delivery_id=did,message='More information',request_id='positive-backfill-001')));self.assertEqual(self.route()['desired'],'🔵')
+        self.app.record_reply('101','7',1,SimpleNamespace(id=150,date=datetime.now(timezone.utc),out=False,raw_text='yes'));self.assertEqual(self.route()['desired'],'🟡')
+    def test_positive_folder_uses_original_identity_after_slot_move(self):
+        self.send();self.app.record_reply('101','7',1,SimpleNamespace(id=102,date=datetime.now(timezone.utc)+timedelta(seconds=1),out=False,raw_text='yeah'));self.app.clients.pop(1);other=FolderClient(user=999);self.app.clients[1]=other;self.app.clients[3]=self.client;self.sync();self.assertEqual(other.calls,0);self.assertEqual(self.route()['account_id'],3);self.assertEqual(self.route()['applied'],'🟡')
+    def test_yes_from_another_sender_does_not_move_this_account_yellow(self):
+        self.send();self.app.db.execute('insert into replies values(?,?,?,?,?,?)',('999','7',102,2,datetime.now(timezone.utc).isoformat(),'yes'));self.app.db.commit();self.app.queue_folder_route('101','7',1,'🔵');self.assertEqual(self.route()['desired'],'🔵')

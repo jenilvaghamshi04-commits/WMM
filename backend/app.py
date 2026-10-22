@@ -219,7 +219,7 @@ def record_reply(principal,target,slot,message):
     if cursor.rowcount:
         advance_lead('dm:'+str(target),'Replied')
         last=db.execute("select o.at,coalesce(d.telegram_message_id,0) from outbox o left join message_details d on d.delivery_id=o.id where o.principal=? and o.target=? and o.kind='dm' and o.status='Sent' order by o.at desc limit 1",(str(principal),str(target))).fetchone()
-        if last and (message.id>last[1] if last[1] else at>=datetime.fromisoformat(last[0]).replace(microsecond=0)):
+        if is_affirmative_reply(text) or (last and (message.id>last[1] if last[1] else at>=datetime.fromisoformat(last[0]).replace(microsecond=0))):
             queue_folder_route(str(principal),str(target),slot,'🟡',force=True)
         queue_auto_yes(str(principal),str(target),slot,message)
     return bool(cursor.rowcount)
@@ -337,13 +337,19 @@ async def reply_sync_loop():
         except Exception:pass  # One unavailable session must not stop checking other senders.
 
 # Telegram emoji folders are separate from delivery status and lead stages.
+def has_positive_reply(principal,target):
+    return any(is_affirmative_reply(row[0]) for row in db.execute('select body from replies where principal=? and target=?',(str(principal),str(target))))
 def queue_folder_route(principal,target,slot,desired,force=False):
+    # A qualified yes keeps this conversation yellow, including after our own replies.
+    if desired=='🔵' and has_positive_reply(principal,target):desired='🟡'
     row=db.execute('select desired from folder_routes where principal=? and target=?',(str(principal),str(target))).fetchone()
     if row and row[0]==desired and not force:return
     db.execute("insert into folder_routes(principal,target,slot,desired,queued_at) values(?,?,?,?,?) on conflict(principal,target) do update set slot=excluded.slot,desired=excluded.desired,revision=folder_routes.revision+1,queued_at=excluded.queued_at,error='',next_attempt_at=''",(str(principal),str(target),slot,desired,stamp()));db.commit()
 def seed_folder_routes():
-    # Catch up existing confirmed DMs once, without resetting already tracked transitions.
+    # Catch up confirmed DMs and repair positive conversations moved blue by older versions.
     for principal,target,slot,last_at in db.execute("select principal,target,slot,max(at) from outbox where kind='dm' and status='Sent' group by principal,target").fetchall():
+        if has_positive_reply(principal,target):
+            queue_folder_route(principal,target,slot,'🟡');continue
         if db.execute('select 1 from folder_routes where principal=? and target=?',(principal,target)).fetchone():continue
         replied=db.execute('select 1 from replies where principal=? and target=? and at>=? limit 1',(principal,target,datetime.fromisoformat(last_at).replace(microsecond=0).isoformat())).fetchone()
         queue_folder_route(principal,target,slot,'🟡' if replied else '🔵')
