@@ -22,6 +22,7 @@ db.execute('create table if not exists telegram_api(id integer primary key, api_
 db.execute('create table if not exists deliveries(id text primary key, status text, at text, error text)')
 db.execute('create table if not exists account_info(slot integer primary key, principal text, label text, phone text, blocked_until text)')
 db.execute('create table if not exists outbox(id text primary key, principal text, slot integer, kind text, target text, contact_id text, status text, day text, at text, error text, message_hash text)')
+db.execute('create table if not exists quota_resets(id text primary key, principal text, slot integer, kind text, day text, after_rowid integer, at text, before_used integer, request_id text, unique(request_id,kind))')
 db.execute('create table if not exists meta(key text primary key, value text)')
 # Preserve confirmed legacy deliveries when upgrading from the single-account version.
 if not db.execute("select 1 from meta where key='outbox_migrated'").fetchone():
@@ -74,10 +75,27 @@ async def identify(slot,c):
     db.execute('update outbox set principal=? where principal=?',(principal,f'slot:{slot}'));db.commit()
     return principal
 
+def quota_floor(principal,kind,date):
+    r=db.execute('select max(after_rowid) from quota_resets where principal=? and kind=? and day=?',(principal,kind,date)).fetchone()
+    return r[0] or 0
+
 def usage(principal):
-    rows=db.execute('select kind,count(*) from outbox where principal=? and day=? group by kind',(principal,today())).fetchall()
-    counts=dict(rows)
-    return {k:{'used':counts.get(k,0),'limit':v,'remaining':max(0,v-counts.get(k,0))} for k,v in LIMITS.items()}
+    date=today();result={}
+    for kind,limit in LIMITS.items():
+        floor=quota_floor(principal,kind,date)
+        count=db.execute('select count(*) from outbox where principal=? and kind=? and day=? and rowid>?',(principal,kind,date,floor)).fetchone()[0]
+        result[kind]={'used':count,'limit':limit,'remaining':max(0,limit-count)}
+    return result
+
+def sent_in_current_quota(principal):
+    date=today();total=0
+    for kind in LIMITS:
+        total+=db.execute("select count(*) from outbox where principal=? and kind=? and day=? and rowid>? and status='Sent'",(principal,kind,date,quota_floor(principal,kind,date))).fetchone()[0]
+    return total
+
+def reset_records():
+    keys=['reset_id','principal','account_id','kind','day','after_rowid','at','before_used','request_id']
+    return [dict(zip(keys,r)) for r in db.execute('select * from quota_resets order by rowid desc limit 100')]
 def records():
     keys=['delivery_id','principal','account_id','kind','target','id','status','day','at','error','message_hash']
     return [dict(zip(keys,r)) for r in db.execute('select * from outbox order by at desc')]
@@ -106,6 +124,9 @@ class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False
 class Config(BaseModel):template:str='';sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3)
 class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None
 class SheetSend(BaseModel):id:str
+class ResetQuota(Account):
+    scope:Literal['dm','group','both']='both'
+    request_id:str=Field(min_length=8,max_length=128)
 class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
 async def health():return {'service':'teamradar','ok':True,'version':'2.0'}
@@ -140,9 +161,28 @@ async def status():
             row=db.execute('select principal,label,phone,blocked_until from account_info where slot=?',(slot,)).fetchone()
             if row:principal,label,phone,blocked=row
         u=usage(principal)
-        sent=db.execute("select count(*) from outbox where principal=? and day=? and status='Sent'",(principal,today())).fetchone()[0]
+        sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,'')})
-    return {'version':'2.0','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records()}
+    return {'version':'2.0','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records()}
+@app.post('/reset-daily-limits',dependencies=[Depends(auth)])
+async def reset_daily_limits(body:ResetQuota):
+    async with lock:
+        client=await ready(body.account_id)
+        principal=await identify(body.account_id,client)
+        kinds=list(LIMITS) if body.scope=='both' else [body.scope]
+        previous=db.execute('select principal,kind,day from quota_resets where request_id=?',(body.request_id,)).fetchall()
+        if previous:
+            if any(r[0]!=principal or r[2]!=today() for r in previous) or {r[1] for r in previous}!=set(kinds):
+                raise HTTPException(409,'This reset request was already used for another account, day or scope. Start a new reset.')
+            return {'ok':True,'account_id':body.account_id,'scope':body.scope,'already_applied':True,'usage':usage(principal)}
+        date=today();before=usage(principal)
+        # Advance only the quota baseline. Delivery/duplicate records and Telegram pauses are untouched.
+        floor=db.execute('select coalesce(max(rowid),0) from outbox').fetchone()[0]
+        with db:
+            for kind in kinds:
+                db.execute('insert into quota_resets values(?,?,?,?,?,?,?,?,?)',(uuid.uuid4().hex,principal,body.account_id,kind,date,floor,stamp(),before[kind]['used'],body.request_id))
+        return {'ok':True,'account_id':body.account_id,'scope':body.scope,'already_applied':False,'usage':usage(principal)}
+
 @app.post('/login',dependencies=[Depends(auth)])
 async def login(body:Login):
     async with lock:

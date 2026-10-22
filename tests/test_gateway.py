@@ -168,5 +168,65 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as e:self.run_async(self.app.deliver(group['id'],1,'group'))
         self.assertEqual(e.exception.status_code,409);self.assertIn('Rejoin',e.exception.detail)
 
+    def test_reset_both_restores_allowance_preserves_history(self):
+        self.sender();self.setup_template()
+        async def run():
+            await self.app.deliver(self.contact(1));await self.app.deliver(self.contact(2,'group'),1,'group')
+            response=await self.app.reset_daily_limits(self.app.ResetQuota(account_id=1,scope='both',request_id='reset-both-001'))
+            self.assertEqual(response['usage']['dm']['used'],0);self.assertEqual(response['usage']['group']['used'],0)
+            self.assertEqual(len(self.app.records()),2);self.assertEqual(len(self.app.reset_records()),2)
+            self.assertEqual(self.app.sent_in_current_quota('101'),0)
+            await self.app.deliver(self.contact(3));self.assertEqual(self.app.usage('101')['dm']['used'],1)
+        self.run_async(run())
+    def test_reset_only_dms_preserves_group_counter_and_other_account(self):
+        self.sender(1);self.sender(2);self.setup_template()
+        async def run():
+            await self.app.deliver(self.contact(1),1);await self.app.deliver(self.contact(2,'group'),1,'group');await self.app.deliver(self.contact(3),2)
+            await self.app.reset_daily_limits(self.app.ResetQuota(account_id=1,scope='dm',request_id='reset-dm-001'))
+            self.assertEqual(self.app.usage('101')['dm']['used'],0);self.assertEqual(self.app.usage('101')['group']['used'],1);self.assertEqual(self.app.usage('102')['dm']['used'],1)
+        self.run_async(run())
+    def test_reset_does_not_bypass_duplicate_or_telegram_pause(self):
+        self.sender();self.setup_template();cid=self.contact(1)
+        async def run():
+            await self.app.deliver(cid)
+            blocked='2099-01-01T00:00:00+00:00'
+            self.app.db.execute('update account_info set blocked_until=? where slot=1',(blocked,));self.app.db.commit()
+            await self.app.reset_daily_limits(self.app.ResetQuota(request_id='reset-pause-001'))
+            self.assertEqual(self.app.db.execute('select blocked_until from account_info where slot=1').fetchone()[0],blocked)
+            with self.assertRaises(HTTPException) as e:await self.app.deliver(cid)
+            self.assertEqual(e.exception.status_code,409)
+            with self.assertRaises(HTTPException) as e:await self.app.deliver(self.contact(2))
+            self.assertEqual(e.exception.status_code,429)
+        self.run_async(run())
+    def test_reset_request_is_idempotent_after_new_sends(self):
+        self.sender();self.setup_template()
+        async def run():
+            request=self.app.ResetQuota(scope='dm',request_id='retry-request-001')
+            await self.app.deliver(self.contact(1));await self.app.reset_daily_limits(request)
+            await self.app.deliver(self.contact(2));r=await self.app.reset_daily_limits(request)
+            self.assertTrue(r['already_applied']);self.assertEqual(r['usage']['dm']['used'],1)
+            self.assertEqual(len(self.app.reset_records()),1)
+        self.run_async(run())
+    def test_reset_persists_after_restart(self):
+        self.sender(user=555);self.setup_template()
+        self.run_async(self.app.deliver(self.contact(1)))
+        self.run_async(self.app.reset_daily_limits(self.app.ResetQuota(scope='dm',request_id='persistent-reset-001')))
+        self.run_async(self.app.deliver(self.contact(2)))
+        self.app.db.close();self.load();self.sender(3,user=555)
+        self.run_async(self.app.identify(3,self.app.clients[3]))
+        self.assertEqual(self.app.usage('555')['dm']['used'],1);self.assertEqual(len(self.app.records()),2)
+    def test_reset_requires_connected_account(self):
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.reset_daily_limits(self.app.ResetQuota(account_id=3,request_id='offline-reset-001')))
+        self.assertEqual(e.exception.status_code,409);self.assertEqual(self.app.reset_records(),[])
+    def test_reset_baseline_expires_at_midnight(self):
+        self.sender();self.setup_template()
+        async def run():
+            with patch.object(self.app,'today',return_value='2026-10-22'):
+                await self.app.deliver(self.contact(1));await self.app.reset_daily_limits(self.app.ResetQuota(request_id='reset-midnight-001'));await self.app.deliver(self.contact(2))
+            with patch.object(self.app,'today',return_value='2026-10-23'):
+                self.assertEqual(self.app.usage('101')['dm']['used'],0);await self.app.deliver(self.contact(3));self.assertEqual(self.app.usage('101')['dm']['used'],1)
+        self.run_async(run())
+
 if __name__=='__main__':unittest.main()
+
 
