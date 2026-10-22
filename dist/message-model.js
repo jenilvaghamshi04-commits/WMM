@@ -2,8 +2,18 @@
   const introduction="Hey @username! Hope you're doing well.\n\nI'm Mark from Wallstreet Market Maker (WMM).\n\nI recently came across $TOKEN and thought it would be worth connecting.\n\nWe work with crypto projects to improve trading liquidity, maintain healthier order books, and manage liquidity across exchanges.\n\nI believe there could be a good opportunity for us to work together.\n\nAre you the right person to discuss this with?";
   const followup="Hey, just following up on my previous message. Is improving liquidity and order-book depth something your team is currently exploring?\nHappy to share how WMM could help. If someone else handles this, could you point me their way?";
   function type(contact){return contact.kind||'dm'}
+  function timestamp(value){const n=Date.parse(value);return Number.isFinite(n)?n:0}
+  function latestFirst(rows,getTime=row=>row.at){return rows.slice().sort((a,b)=>timestamp(getTime(b))-timestamp(getTime(a)))}
+  function latestContacts(contacts,history){
+    const latest=new Map();
+    for(const d of history){const key=(d.kind||'dm')+':'+String(d.target),time=timestamp(d.at);latest.set(key,Math.max(latest.get(key)||0,time))}
+    return contacts.map(contact=>{const kind=type(contact),target=kind==='group'?contact.group_id:contact.user_id;return {contact,time:Math.max(timestamp(contact.scanned_at),latest.get(kind+':'+String(target))||0)}}).sort((a,b)=>b.time-a.time).map(row=>row.contact);
+  }
+  function latestAccounts(accounts,contacts,history,resets){
+    return accounts.map(account=>{const times=[account.health?.last_sent_at,account.health?.last_error_at,...contacts.filter(c=>c.scan_account===account.id).map(c=>c.scanned_at),...history.filter(d=>d.account_id===account.id).map(d=>d.at),...resets.filter(r=>r.account_id===account.id).map(r=>r.at)];return {account,time:times.reduce((n,t)=>Math.max(n,timestamp(t)),0)}}).sort((a,b)=>b.time-a.time).map(row=>row.account);
+  }
   function summarize(rows){
-    rows=rows.slice().sort((a,b)=>new Date(b.at)-new Date(a.at));
+    rows=latestFirst(rows);
     const sent=rows.filter(d=>d.status==='Sent'),pending=rows.some(d=>d.status==='Sending'||d.status==='Uncertain');
     return {rows,sent,latest:rows[0]||null,lastSent:sent[0]||null,firstMessage:sent.filter(d=>!d.followup_of).at(-1)||rows.at(-1)||null,lastFollowup:sent.find(d=>d.followup_of)||null,followups:sent.filter(d=>!!d.followup_of).length,canSend:sent.length===0&&!pending,canFollowup:sent.length>0&&!pending,pending};
   }
@@ -14,7 +24,7 @@
   function conversations(history){
     const grouped=new Map();
     for(const d of history){const key=(d.kind||'dm')+':'+(d.target??d.id);if(!grouped.has(key))grouped.set(key,[]);grouped.get(key).push(d)}
-    return [...grouped.values()].map(summarize).sort((a,b)=>new Date(b.latest.at)-new Date(a.latest.at));
+    return latestFirst([...grouped.values()].map(summarize),s=>s.latest.at);
   }
   function normalizeToken(value){return String(value||'').trim().replace(/^\$+/,'')}
   function requiresToken(text){return /\$TOKEN\b|\{\{token\}\}/.test(text||'')}
@@ -30,5 +40,5 @@
     }
     return {message:state(false),followup:state(true)};
   }
-  root.WMMMessageModel={type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken};
+  root.WMMMessageModel={type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken,latestFirst,latestContacts,latestAccounts};
 })(typeof window==='undefined'?globalThis:window);

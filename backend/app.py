@@ -85,7 +85,9 @@ DEFAULT_FOLLOWUP="Hey, just following up on my previous message. Is improving li
 def settings():
     r=db.execute('select data from settings where id=1').fetchone()
     return {'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'',**(json.loads(r[0]) if r else {})}
-def contacts():return [c for r in db.execute('select data from contacts') if not (c:=json.loads(r[0])).get('is_bot',False)]
+def contacts():
+    rows=[c for r in db.execute('select data from contacts order by rowid desc') if not (c:=json.loads(r[0])).get('is_bot',False)]
+    return sorted(rows,key=lambda c:c.get('scanned_at') or '',reverse=True)
 def save(c):db.execute('insert or replace into contacts values(?,?)',(c['id'],json.dumps(c)));db.commit()
 def session_path(slot):return str(ROOT/('telegram' if slot==1 else f'telegram_{slot}'))
 def make_client(slot):
