@@ -98,3 +98,7 @@ Authenticated `POST /templates` updates both texts without changing spreadsheet,
 ## Newest activity first
 
 Saved contacts and CSV exports sort by the latest scan or message/follow-up attempt for the recipient. Sent conversations and their history sort newest first. Activity merges local events, server deliveries and quota resets by their original timestamps before formatting dates. Account cards in the workspace and Account health sort by their latest scan, send, error or quota reset; routine health polling does not change their order. Connection selectors retain stable account numbers. Gateway contact responses and Google Sheets scans are newest first, with legacy undated rows last.
+
+## Light and dark themes
+
+Use the Light/Dark switch on the login screen or workspace header. The workspace follows the device theme until a choice is saved, then remembers the selection in this browser and synchronizes it across open tabs. All pages, forms, dialogs, previews and status colors share the theme palette. Theme preference is separate from login and Telegram account data.
