@@ -10,7 +10,7 @@ from test_gateway import FakeClient
 class LeadTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.env=patch.dict(os.environ,{'DATA_DIR':self.tmp.name,'DASHBOARD_KEY':'test-secret','TELEGRAM_API_ID':'','TELEGRAM_API_HASH':''});self.env.start()
-        spec=importlib.util.spec_from_file_location('lead_gateway','backend/app.py');self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app)
+        spec=importlib.util.spec_from_file_location('lead_gateway','backend/app.py');self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app);self.app.enforce_send_pacing=lambda *args:None
         self.client=FakeClient(user=101);self.app.clients[1]=self.client
         self.app.save({'id':'scanA:7','user_id':'7','name':'Lead Seven','username':'','kind':'dm','group':'Test group','group_id':'-1001','scanned_at':datetime.now(timezone.utc).isoformat()})
     def tearDown(self):self.app.db.close();self.env.stop();self.tmp.cleanup()
@@ -54,7 +54,7 @@ class LeadTests(unittest.TestCase):
         self.send();self.run_async(self.app.update_lead(self.app.LeadUpdate(key='dm:7',stage='Meeting',reminder_days=7)));self.app.record_reply('101','7',1,self.message())
         self.app.save({'id':'scanB:7','user_id':'7','name':'Same lead','kind':'dm'});self.assertEqual(len(self.app.lead_records()),1)
         self.assertEqual(self.lead()['stage'],'Meeting');self.assertEqual(self.lead()['reminder_days'],7)
-        self.app.db.close();spec=importlib.util.spec_from_file_location('reloaded_leads','backend/app.py');self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app);self.assertEqual(self.lead()['stage'],'Meeting');self.assertEqual(self.lead()['reply_status'],'Replied')
+        self.app.db.close();spec=importlib.util.spec_from_file_location('reloaded_leads','backend/app.py');self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app);self.app.enforce_send_pacing=lambda *args:None;self.assertEqual(self.lead()['stage'],'Meeting');self.assertEqual(self.lead()['reply_status'],'Replied')
     def test_groups_do_not_become_replies_or_reminders(self):
         self.app.save({'id':'group:-1001','group_id':'-1001','name':'Test group','kind':'group'});self.run_async(self.app.deliver('group:-1001',1,kind='group',message='Hello group'));lead=next(l for l in self.app.lead_records() if l['kind']=='group');self.assertEqual(lead['reply_status'],'Not tracked');self.assertFalse(lead['reminder_active'])
     def test_history_sync_collects_only_incoming_and_tracks_cursor(self):

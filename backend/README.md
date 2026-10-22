@@ -17,9 +17,9 @@ API ID and API Hash can now be entered directly in Connections after connecting 
 
 The gateway download is a self-contained copy: app.py can serve its included dist/ folder. Run `python -m uvicorn app:app` from the extracted folder and install `requirements.txt`. For the GitHub repository layout use `python -m uvicorn backend.app:app` instead.
 
-V2 supports three independent slots. Select Account 1, 2 or 3 in Connections before entering API and phone details. In Compose choose the sender and DM/group mode, select recipients and click Send message. Limits are 15 DM attempts and 30 group attempts per Telegram identity per IST day. The 10/day target is manual progress, not a scheduler. Sheet checkboxes use the saved template and sender. Preserve DATA_DIR to retain limits and Telegram sessions.
+V2 supports three independent slots. Select Account 1, 2 or 3 in Connections before entering API and phone details. In Compose choose the sender and DM/group mode, select recipients and click Send message. Limits are 15 new DM recipients and 30 group attempts per Telegram identity per IST day. The 10/day target is manual progress, not a scheduler. Sheet checkboxes use the saved template and sender. Preserve DATA_DIR to retain limits and Telegram sessions.
 
-WMM Team v3 adds dashboard login: admin / DASHBOARD_KEY by default, or configure DASHBOARD_USERNAME and DASHBOARD_PASSWORD. Saved data and Sent messages are separate app pages. Follow-ups use the original sender, count against its daily limits and remain in delivery history. Bot admins are excluded.
+WMM Team v3 adds dashboard login: admin / DASHBOARD_KEY by default, or configure DASHBOARD_USERNAME and DASHBOARD_PASSWORD. Saved data and Sent messages are separate app pages. Follow-ups use the original sender, share its sending delay and remain in delivery history. Repeat DMs do not use additional new-recipient slots. Bot admins are excluded.
 
 
 Automatic replies (v3.4): deploy the latest commit, then choose a token/exchange and enable automatic yes / no replies in a new Saved data send preview. The gateway must remain online to detect incoming replies. Clear yes replies send the pitch then the demo/call invitation; clear no replies send the free-demo offer once. Edit all five texts in Message templates, pause globally there, or pause a pending contact in Lead / replies. New enrollments snapshot the selected context and texts; older conversations remain unarmed. Failed/uncertain automated deliveries stop for review. Existing Telegram waits and daily recipient limits remain enforced.
@@ -60,3 +60,15 @@ Activation requires the exact public WMM Render URL. Set `gateway_url` in `confi
 `scripts/ping_gateway.py` accepts only public HTTPS `.onrender.com` service roots or `/health` URLs, rejects embedded credentials/query parameters/other paths, verifies a healthy WMM JSON response, and retries cold starts up to three times within the job's timeout. The health endpoint sends Cache-Control: no-store and returns only service/health/version data. The scheduler never sends Telegram messages or changes application data. A public service URL in the config is not a credential.
 
 GitHub scheduled runs are best-effort and may be delayed or dropped; public-repository schedules can be disabled after 60 days without repository activity. Render's free plan still has restarts and monthly usage limits. This reduces idle spin-down risk; it does not guarantee continuous uptime or make local SQLite/session storage persistent across Render restarts. Official references: https://render.com/docs/free and https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule .
+
+## v3.7: message spacing and imports
+
+Deploy the latest commit, installing `backend/requirements.txt` as usual. No new environment variables are required for uploaded CSV/TSV/XLSX imports. Google Sheets imports reuse `GOOGLE_SERVICE_ACCOUNT_JSON`; share the source sheet with its client email as Viewer. The Google importer reads only a bounded range on the requested tab (or the first tab) and never changes that sheet.
+
+Authenticated endpoints:
+- `POST /sending-pace` with `delay_seconds` of 120, 300 or 600. Default 120 seconds; no disabled/zero-delay mode.
+- `POST /contacts/import/read` with either `filename` + `content_base64`, or `sheet_url` + optional `worksheet`.
+- `POST /contacts/import/preview` with returned rows, chosen zero-based column mapping, `has_header`, and optional `default_kind` (`dm` / `group`). Returns reviewed rows and a batch ID expiring after 30 minutes.
+- `POST /contacts/import/confirm` with `batch_id` to add valid unique contacts. Rechecks duplicates at confirmation and consumes the batch once.
+
+A local cooldown responds with HTTP 429 and `detail.code=send_cooldown`, `retry_after`, and `next_available_at`; this is the only send response the dashboard waits and retries automatically. Telegram FloodWait/PeerFlood, daily caps, uncertain delivery, and other errors stop the action. Every send path shares the persisted cooldown keyed to Telegram identity. Reset actions preserve cooldowns. Existing Render free ephemeral-storage limits still apply; keep `DATA_DIR` durable for restart-safe records across host replacement.

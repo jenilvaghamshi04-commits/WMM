@@ -27,7 +27,7 @@ class FolderTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.env=patch.dict(os.environ,{'DATA_DIR':self.tmp.name,'DASHBOARD_KEY':'test-secret','TELEGRAM_API_ID':'','TELEGRAM_API_HASH':''});self.env.start();self.load()
         self.client=FolderClient(user=101);self.app.clients[1]=self.client;self.app.save({'id':'dm:7','user_id':'7','name':'Lead Seven','kind':'dm','username':'','group':'Test group'})
     def load(self):
-        spec=importlib.util.spec_from_file_location('folder_test_gateway','backend/app.py');self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app)
+        spec=importlib.util.spec_from_file_location('folder_test_gateway','backend/app.py');self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app);self.app.enforce_send_pacing=lambda *args:None
     def tearDown(self):self.app.db.close();self.env.stop();self.tmp.cleanup()
     def run_async(self,coro):return asyncio.run(coro)
     def send(self):

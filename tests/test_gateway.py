@@ -25,6 +25,8 @@ class GatewayTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.env=patch.dict(os.environ,{'DATA_DIR':self.tmp.name,'DASHBOARD_KEY':'test-secret','TELEGRAM_API_ID':'','TELEGRAM_API_HASH':''});self.env.start();self.load()
     def load(self):
         spec=importlib.util.spec_from_file_location('gateway_under_test','backend/app.py');self.app=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.app)
+        # These regression tests isolate quotas, routing and templates. Pacing has dedicated clock-based tests.
+        self.real_pacing=self.app.enforce_send_pacing;self.app.enforce_send_pacing=lambda *args:None
     def tearDown(self):self.app.db.close();self.env.stop();self.tmp.cleanup()
     def run_async(self,coro):return asyncio.run(coro)
     def sender(self,slot=1,user=None):

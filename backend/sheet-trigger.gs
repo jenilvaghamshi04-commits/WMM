@@ -23,7 +23,10 @@ function teamRadarOnEdit(e) {
         muteHttpExceptions: true
       });
       const body = JSON.parse(response.getContentText());
-      status.setValue(response.getResponseCode() === 200 ? 'Sent' : (body.detail || 'Failed'));
+      const detail = typeof body.detail === 'string' ? body.detail : (body.detail && body.detail.message) || 'Failed';
+      status.setValue(response.getResponseCode() === 200 ? 'Sent' : detail);
+      // This is a local cooldown, not a delivery attempt. Let the user check again after the wait.
+      if (body.detail && body.detail.code === 'send_cooldown') range.setValue(false);
     } catch (err) { status.setValue('Uncertain: check Telegram before retry'); }
   } finally { lock.releaseLock(); }
 }

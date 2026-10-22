@@ -1,4 +1,4 @@
-import os,json,sqlite3,asyncio,secrets,re,hashlib,uuid,copy
+import os,json,sqlite3,asyncio,secrets,re,hashlib,uuid,copy,math
 from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -13,7 +13,7 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.6')
+app=FastAPI(title='WMM Team',version='3.7')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
 lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
@@ -29,6 +29,8 @@ db.execute('create table if not exists login_failures(client_hash text, at text)
 db.execute('create table if not exists message_details(delivery_id text primary key, body text, recipient_name text, username text, sender_label text, followup_of text)')
 if 'token_symbol' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column token_symbol text not null default ''")
 db.execute('create table if not exists followup_requests(request_id text primary key, delivery_id text, parent_id text, message_hash text)')
+db.execute('create table if not exists send_pacing(principal text primary key,last_attempt_at text)')
+db.execute('create table if not exists import_batches(id text primary key,data text,expires_at text)')
 db.execute('create table if not exists meta(key text primary key, value text)')
 db.execute('create table if not exists workspace_reset_requests(request_id text primary key,result text)')
 if 'telegram_message_id' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column telegram_message_id integer not null default 0")
@@ -109,7 +111,33 @@ DEFAULT_YES_DEMO="We can give you a free demo also\nIf you have time we can jump
 DEFAULT_NO_REPLY="We can also offer a free demo so you can see how we work before making a decision. Would you be open to a quick call to discuss what could work for your project?"
 def settings():
     r=db.execute('select data from settings where id=1').fetchone()
-    return {'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'','yes_pitch_template':DEFAULT_YES_PITCH,'yes_demo_template':DEFAULT_YES_DEMO,'no_reply_template':DEFAULT_NO_REPLY,'auto_yes_enabled':True,'auto_followup_enabled':True,**(json.loads(r[0]) if r else {})}
+    return {'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'','yes_pitch_template':DEFAULT_YES_PITCH,'yes_demo_template':DEFAULT_YES_DEMO,'no_reply_template':DEFAULT_NO_REPLY,'auto_yes_enabled':True,'auto_followup_enabled':True,'send_delay_seconds':120,**(json.loads(r[0]) if r else {})}
+def pacing_status(principal):
+    row=db.execute('select last_attempt_at from send_pacing where principal=?',(principal,)).fetchone()
+    # Cover deliveries made before the pacing migration too.
+    prior=db.execute('select max(at) from outbox where principal=?',(principal,)).fetchone()[0]
+    last=max(filter(None,[row[0] if row else None,prior]),default=None)
+    delay=max(120,int(settings().get('send_delay_seconds',120)))
+    next_at=(datetime.fromisoformat(last)+timedelta(seconds=delay)) if last else None
+    remaining=max(0,math.ceil((next_at-datetime.now(timezone.utc)).total_seconds())) if next_at else 0
+    return {'delay_seconds':delay,'retry_after':remaining,'next_available_at':next_at.isoformat() if remaining else None}
+def pause_for_telegram(principal,exc):
+    seconds=exc.seconds if isinstance(exc,errors.FloodWaitError) else 86400
+    blocked=(datetime.now(timezone.utc)+timedelta(seconds=seconds)).isoformat()
+    db.execute("update account_info set blocked_until=max(coalesce(blocked_until,''),?) where principal=?",(blocked,str(principal)));db.commit()
+def enforce_send_pacing(principal,slot=None):
+    pace=pacing_status(principal)
+    if pace['retry_after']:
+        raise HTTPException(429,{'code':'send_cooldown','account_id':slot,'message':f"Account is cooling down. Next message in {pace['retry_after']} seconds.",**pace},headers={'Retry-After':str(pace['retry_after'])})
+class SendingPace(BaseModel):
+    delay_seconds:Literal[120,300,600]=120
+@app.post('/sending-pace',dependencies=[Depends(auth)])
+async def update_sending_pace(body:SendingPace):
+    async with lock:
+        cfg={**settings(),'send_delay_seconds':body.delay_seconds}
+        db.execute('insert or replace into settings values(1,?)',(json.dumps(cfg),));db.commit()
+    return {'ok':True,'delay_seconds':body.delay_seconds}
+
 def contacts():
     rows=[c for r in db.execute('select data from contacts order by rowid desc') if not (c:=json.loads(r[0])).get('is_bot',False)]
     return sorted(rows,key=lambda c:c.get('scanned_at') or '',reverse=True)
@@ -534,12 +562,12 @@ async def process_auto_yes(limit=1):
             except Exception as exc:
                 existing=db.execute('select status from auto_yes_jobs where id=?',(job_id,)).fetchone()[0]
                 attempt=db.execute('select o.status from followup_requests f join outbox o on o.id=f.delivery_id where f.request_id=?',('auto-yes:'+job_id+':'+str(current_part),)).fetchone()
-                detail=exc.detail if isinstance(exc,HTTPException) else 'Automatic message delivery failed. Review the conversation and delivery history.'
+                detail=(exc.detail.get('message',str(exc.detail)) if isinstance(exc.detail,dict) else exc.detail) if isinstance(exc,HTTPException) else 'Automatic message delivery failed. Review the conversation and delivery history.'
                 state='Needs attention';next_at=''
                 if existing=='Cancelled':state='Cancelled'
                 elif isinstance(exc,HTTPException) and exc.status_code==423:state='Paused'
                 elif not attempt and isinstance(exc,HTTPException) and (exc.status_code==429 or 'Reconnect the original sender' in str(detail)):
-                    state='Pending';next_at=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
+                    state='Pending';next_at=(exc.detail.get('next_available_at') if isinstance(exc.detail,dict) else None) or (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
                 db.execute('update auto_yes_jobs set status=?,error=?,next_attempt_at=? where id=?',(state,detail,next_at,job_id));db.commit();results.append({'job_id':job_id,'status':state,'error':detail})
         return {'processed':len(results),'results':results}
 async def auto_yes_loop():
@@ -626,7 +654,7 @@ async def process_auto_followups(limit=1):
                     gate,reason=auto_followup_gate((root,principal,target))
                     state=gate or 'Needs attention'
                     if gate:error=reason
-                if state in ('Waiting','Paused'):retry=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
+                if state in ('Waiting','Paused'):retry=(exc.detail.get('next_available_at') if isinstance(exc,HTTPException) and isinstance(exc.detail,dict) else None) or (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
             db.execute('update auto_followup_jobs set status=?,error=?,next_attempt_at=? where root_id=?',(state,error,retry,root));db.commit()
             results.append({'root_id':root,'status':state,'error':error})
         return {'processed':len(results),'results':results}
@@ -693,7 +721,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.6'},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.7'},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -726,10 +754,10 @@ async def status():
             if row:principal,label,phone,blocked=row
         u=usage(principal)
         sent=sent_in_current_quota(principal)
-        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),**login_progress(slot)})
-    return {'version':'3.6','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True}}
+        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
+    return {'version':'3.7','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'contact_import':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
-WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs')
+WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches')
 def workspace_reset_counts():
     count=lambda table:db.execute('select count(*) from '+table).fetchone()[0]
     return {'contacts':count('contacts'),'messages':count('outbox'),'replies':count('replies'),'leads':len(lead_records()),'automations':count('auto_yes_jobs')+count('auto_yes_enrollments')+count('auto_followup_jobs')}
@@ -966,6 +994,20 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if expected_principal and expected_principal!=principal:raise HTTPException(409,'The original sender is not logged into this account slot. Reconnect the original Telegram account to send this follow-up.')
         if (kind=='group') != (contact.get('kind')=='group'):raise HTTPException(400,'Choose a group chat for group messages or a team member for DMs')
         if kind=='group' and contact.get('membership',{}).get(str(slot))=='left':raise HTTPException(409,f'Account {slot} left this group. Rejoin and rescan with Leave group after scan switched off before sending group messages.')
+        resolved_peer=None
+        if contact.get('import_unresolved'):
+            pause=db.execute('select blocked_until from account_info where slot=?',(slot,)).fetchone()
+            if pause and pause[0] and pause[0]>stamp():raise HTTPException(429,'This account is paused by Telegram until '+pause[0])
+            enforce_send_pacing(principal,slot)
+            try:resolved=await c.get_entity(contact['username'])
+            except (errors.FloodWaitError,errors.PeerFloodError) as exc:
+                pause_for_telegram(principal,exc);raise
+            except (ValueError,TypeError):raise HTTPException(409,'Telegram could not find this imported username. Check the link or scan the group first.')
+            if kind=='dm' and (not isinstance(resolved,types.User) or getattr(resolved,'bot',False) or getattr(resolved,'deleted',False)):raise HTTPException(400,'This imported link is not a person. Use a Group chat import or Find team for groups; bots are excluded.')
+            if kind=='group' and not (isinstance(resolved,types.Chat) or getattr(resolved,'megagroup',False)):raise HTTPException(400,'This imported link is not a group chat. Channels cannot receive group messages.')
+            field='group_id' if kind=='group' else 'user_id'
+            contact[field]=str(utils.get_peer_id(resolved) if kind=='group' else resolved.id)
+            contact['import_unresolved']=False;save(contact);resolved_peer=resolved
         text=(message if message is not None else settings()['template']).strip()
         if not text:raise HTTPException(400,'Write your message before sending')
         symbol=normalize_token(settings().get('token_symbol','') if token_symbol is None else token_symbol)
@@ -1007,13 +1049,17 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if info and info[0] and info[0]>stamp():raise HTTPException(429,'This account is paused by Telegram until '+info[0])
         u=usage(principal)[kind]
         if u['remaining']<=0 and (kind!='dm' or dm_needs_new_slot(principal,target,date)):raise HTTPException(429,f"Account {slot} reached today's {LIMITS[kind]} {'new DM recipient' if kind=='dm' else 'group message'} limit. Resets at midnight Asia/Kolkata.")
+        enforce_send_pacing(principal,slot)
         # Resolve the destination using this sender's own Telegram permissions before reserving a send.
         try:
-            if kind=='group':peer=await c.get_entity(int(target))
+            if resolved_peer is not None:peer=resolved_peer
+            elif kind=='group':peer=await c.get_entity(int(target))
             elif contact.get('username'):
                 peer=await c.get_entity(contact['username'])
                 if str(peer.id)!=target:raise HTTPException(409,'Username now belongs to another user. Rescan this contact before sending.')
             else:peer=await c.get_input_entity(int(target))
+        except (errors.FloodWaitError,errors.PeerFloodError) as exc:
+            pause_for_telegram(principal,exc);raise
         except (ValueError,TypeError):raise HTTPException(409,'This sender cannot resolve the recipient. Scan its group with this account first.')
         if kind=='dm' and getattr(peer,'bot',False):raise HTTPException(400,'This contact is a Telegram bot. Bot admins are excluded.')
         if kind=='group' and not (isinstance(peer,types.Chat) or getattr(peer,'megagroup',False)):raise HTTPException(400,'The selected destination is not a group chat')
@@ -1025,6 +1071,7 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             db.execute('insert into message_details(delivery_id,body,recipient_name,username,sender_label,followup_of,token_symbol) values(?,?,?,?,?,?,?)',(delivery_id,text,contact['name'],contact.get('username',''),sender_label,followup_of,symbol))
             db.execute('update message_details set exchange=?,automation_step=? where delivery_id=?',(exchange,automation_step,delivery_id))
             if followup_of:db.execute('insert into followup_requests values(?,?,?,?)',(request_id,delivery_id,followup_of,digest))
+        db.execute('insert or replace into send_pacing values(?,?)',(principal,stamp()));db.commit()
         try:sent_message=await c.send_message(peer,text)
         except errors.FloodWaitError as exc:
             blocked=(datetime.now(timezone.utc)+timedelta(seconds=exc.seconds)).isoformat()
@@ -1056,6 +1103,98 @@ async def follow_up(body:Followup):
     saved_token=db.execute('select token_symbol,exchange from message_details where delivery_id=?',(body.delivery_id,)).fetchone()
     symbol=body.token_symbol if body.token_symbol is not None else (saved_token[0] if saved_token else '')
     return await deliver(cid,slot,kind,body.message,followup_of=body.delivery_id,request_id=body.request_id,expected_principal=principal,token_symbol=symbol,exchange=saved_token[1] if saved_token else '')
+
+# Spreadsheet imports are staged for review; they never join chats or send messages.
+try:from backend import contact_import as importer
+except ImportError:import contact_import as importer
+class ImportRead(BaseModel):
+    filename:str=Field(default='',max_length=200)
+    content_base64:str=Field(default='',max_length=7*1024*1024)
+    sheet_url:str=Field(default='',max_length=2000)
+    worksheet:str=Field(default='',max_length=100)
+class ImportPreview(BaseModel):
+    rows:list[list[str]]=Field(max_length=1001)
+    mapping:dict[str,int|None]
+    has_header:bool=True
+    default_kind:Literal['dm','group']='dm'
+    source_name:str=Field(default='Spreadsheet import',max_length=200)
+class ImportConfirm(BaseModel):
+    batch_id:str=Field(max_length=64)
+
+def import_error(exc):raise HTTPException(400,str(exc))
+@app.post('/contacts/import/read',dependencies=[Depends(auth)])
+async def read_import(body:ImportRead):
+    if bool(body.content_base64)==bool(body.sheet_url):raise HTTPException(400,'Choose one file or Google Sheets URL.')
+    if body.sheet_url:
+        try:book_id=importer.sheet_identifier(body.sheet_url)
+        except ValueError as exc:import_error(exc)
+        if not os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON'):raise HTTPException(409,'Google Sheets import needs the service account configured on your gateway. You can also download the tab as CSV or XLSX and upload it here.')
+        def read_google():
+            import gspread
+            gc=gspread.service_account_from_dict(json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']))
+            book=gc.open_by_key(book_id)
+            ws=book.worksheet(body.worksheet) if body.worksheet else book.get_worksheet(0)
+            return importer.bounded_matrix(ws.get('A1:AE1003'))
+        try:rows=await asyncio.to_thread(read_google)
+        except ValueError as exc:import_error(exc)
+        except Exception:raise HTTPException(400,'Could not read that tab. Share the sheet with your gateway service-account email as Viewer, check the tab name, or upload a CSV/XLSX export.')
+    else:
+        try:rows=await asyncio.to_thread(importer.read_file,body.filename,body.content_base64)
+        except ValueError as exc:import_error(exc)
+    mapping,has_header=importer.default_mapping(rows)
+    return {'rows':rows,'mapping':mapping,'has_header':has_header,'source_name':body.filename or 'Google Sheets import','columns':len(rows[0])}
+
+def import_candidates(rows,mapping,has_header,default_kind):
+    try:rows=importer.bounded_matrix(rows)
+    except ValueError as exc:import_error(exc)
+    if any(len(v)>500 for r in rows for v in r):raise HTTPException(400,'Cells may contain at most 500 characters.')
+    if mapping.get('telegram') is None:raise HTTPException(400,'Choose the column containing Telegram usernames or links.')
+    if any(v is not None and (v<0 or v>=len(rows[0])) for v in mapping.values()):raise HTTPException(400,'Choose a valid spreadsheet column.')
+    data=rows[1:] if has_header else rows
+    if len(data)>1000:raise HTTPException(400,'Import at most 1,000 contacts at a time.')
+    known={c.get('username','').lower() for c in contacts() if c.get('username')};seen=set();items=[];candidates=[]
+    def value(row,field):
+        col=mapping.get(field)
+        return row[col] if col is not None else ''
+    for number,row in enumerate(data,2 if has_header else 1):
+        item={'row':number,'telegram':value(row,'telegram'),'name':value(row,'name'),'status':'Ready','reason':''}
+        try:
+            handle=importer.telegram_handle(item['telegram'])
+            kind=value(row,'kind').strip().lower() or default_kind
+            if kind in ('person','people','user','contact'):kind='dm'
+            if kind in ('gc','group chat','groupchat'):kind='group'
+            if kind not in ('dm','group'):raise ValueError('Type must be dm or group.')
+            if handle in known or handle in seen:item.update(status='Duplicate',reason='Already saved or repeated in this import.')
+            else:
+                cid='import:'+kind+':'+handle
+                c={'id':cid,'name':item['name'] or '@'+handle,'username':handle,'user_id':cid if kind=='dm' else '', 'group_id':cid if kind=='group' else '', 'kind':kind,'role':value(row,'role') or ('Group chat' if kind=='group' else 'Imported contact'),'group':value(row,'group') or 'Spreadsheet import','link':'https://t.me/'+handle,'source':'Spreadsheet import · role not verified','status':'Ready','is_bot':False,'import_unresolved':True}
+                candidates.append(c);seen.add(handle)
+            item.update(username=handle,kind=kind,name=item['name'] or '@'+handle)
+        except ValueError as exc:item.update(status='Skipped',reason=str(exc))
+        items.append(item)
+    return candidates,items
+@app.post('/contacts/import/preview',dependencies=[Depends(auth)])
+async def preview_import(body:ImportPreview):
+    async with lock:
+        candidates,items=import_candidates(body.rows,body.mapping,body.has_header,body.default_kind)
+        batch=uuid.uuid4().hex;expiry=(datetime.now(timezone.utc)+timedelta(minutes=30)).isoformat()
+        db.execute('delete from import_batches where expires_at<?',(stamp(),))
+        db.execute('insert into import_batches values(?,?,?)',(batch,json.dumps({'contacts':candidates,'source':body.source_name}),expiry));db.commit()
+        return {'batch_id':batch,'items':items,'ready':len(candidates),'duplicates':sum(i['status']=='Duplicate' for i in items),'skipped':sum(i['status']=='Skipped' for i in items),'expires_at':expiry}
+@app.post('/contacts/import/confirm',dependencies=[Depends(auth)])
+async def confirm_import(body:ImportConfirm):
+    async with lock:
+        batch=db.execute('select data,expires_at from import_batches where id=?',(body.batch_id,)).fetchone()
+        if not batch or batch[1]<stamp():raise HTTPException(409,'This preview expired or was already imported. Preview the sheet again.')
+        payload=json.loads(batch[0]);known={c.get('username','').lower() for c in contacts() if c.get('username')};added=0;duplicates=0
+        with db:
+            for c in payload['contacts']:
+                if c['username'] in known:duplicates+=1;continue
+                c.update(scanned_at=stamp(),imported_at=stamp(),import_source=payload['source'])
+                db.execute('insert or ignore into contacts values(?,?)',(c['id'],json.dumps(c)))
+                known.add(c['username']);added+=1
+            db.execute('delete from import_batches where id=?',(body.batch_id,))
+        return {'ok':True,'added':added,'duplicates':duplicates}
 
 @app.post('/sheet-send',dependencies=[Depends(auth)])
 async def sheet_send(body:SheetSend):
