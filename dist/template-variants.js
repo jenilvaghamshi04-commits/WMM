@@ -7,14 +7,29 @@
   }
   root.WMMTemplateVariants={normalize,pick};
 })(typeof window==='undefined'?globalThis:window);
-let savedTemplateVariants={},templateVariantDrafts={},templateVariantActive={},contactAutoTemplates=null,initialBatchPlan=null;
+let savedTemplateVariants={},templateVariantDrafts={},templateVariantActive={},contactAutoTemplates=null,initialBatchPlan=null,templateRotationUsed={},templateRotationLast={};
 function legacyTemplateValue(key){return ({template:savedTemplate,followup_template:savedFollowupTemplate,yes_pitch_template:savedYesPitch,yes_demo_template:savedYesDemo})[key]||({template:WMMMessageModel.introduction,followup_template:WMMMessageModel.followup,yes_pitch_template:WMMMessageModel.yesPitch,yes_demo_template:WMMMessageModel.yesDemo})[key]}
 function hydrateTemplateVariants(cfg){
   const previous=JSON.stringify(savedTemplateVariants);savedTemplateVariants={};
+  if(cfg.template_rotation)for(const [key,state] of Object.entries(cfg.template_rotation)){templateRotationUsed[key]=[...(state.used||[])];templateRotationLast[key]=state.last||''}
   for(const [,key,fallback] of templateFields)savedTemplateVariants[key]=WMMTemplateVariants.normalize(cfg.template_variants?.[key],cfg[key]||WMMMessageModel[fallback]);
   if(previous!==JSON.stringify(savedTemplateVariants))initialBatchPlan=null;
 }
-function pickSavedTemplate(key){const options=savedTemplateVariants[key];return WMMTemplateVariants.pick(options?.some(text=>text.trim())?options:[legacyTemplateValue(key)])}
+function pickSavedTemplate(key,used=templateRotationUsed,last=templateRotationLast){
+  const options=savedTemplateVariants[key]?.some(text=>text.trim())?savedTemplateVariants[key]:[legacyTemplateValue(key)];
+  const unique=[...new Set(options.map(t=>t.trim()).filter(Boolean))],seen=used[key]||[];let available=unique.filter(t=>!seen.includes(t));
+  if(!available.length)available=unique.slice();
+  if((!seen.length||unique.every(t=>seen.includes(t)))&&available.length>1)available=available.filter(t=>t!==last[key]);
+  const choice=WMMTemplateVariants.pick(available);return {text:choice.text,index:options.findIndex(t=>t.trim()===choice.text)};
+}
+function recordTemplateChoices(choices){for(const [key,text] of Object.entries(choices||{})){const pool=[...new Set((savedTemplateVariants[key]||[]).map(t=>t.trim()).filter(Boolean))];let used=(templateRotationUsed[key]||[]).filter(t=>pool.includes(t));if(pool.every(t=>used.includes(t)))used=[];if(!used.includes(text))used.push(text);templateRotationUsed[key]=used;templateRotationLast[key]=text;}}
+function messageTemplateChoices(path,body){
+  if(path==='/conversation/reply')return {};
+  const choices={},key=path==='/follow-up'?'followup_template':'template';
+  if((savedTemplateVariants[key]||[]).some(t=>t.trim()===body.message))choices[key]=body.message;
+  if(body.auto_yes)for(const [name,text] of Object.entries(body.auto_reply_templates||{}))choices[name]=text;
+  return choices;
+}
 function loadVariantEditors(){
   for(const [id,key,fallback] of templateFields){
     templateVariantDrafts[id]=WMMTemplateVariants.normalize(savedTemplateVariants[key],legacyTemplateValue(key)||WMMMessageModel[fallback]);if(!templateVariantDrafts[id].some(text=>text.trim()))templateVariantDrafts[id][0]=legacyTemplateValue(key)||WMMMessageModel[fallback];
@@ -64,14 +79,14 @@ function chooseFollowupTemplate(){
 }
 function getInitialBatchPlan(ids){
   const signature=JSON.stringify([ids,savedTemplateVariants.template||[legacyTemplateValue('template')]]);
-  if(!initialBatchPlan||initialBatchPlan.signature!==signature)initialBatchPlan={signature,messages:new Map(ids.map(id=>[id,pickSavedTemplate('template')]))};
+  if(!initialBatchPlan||initialBatchPlan.signature!==signature)initialBatchPlan={signature,messages:new Map((()=>{const used=JSON.parse(JSON.stringify(templateRotationUsed)),last={...templateRotationLast};return ids.map(id=>{const choice=pickSavedTemplate('template',used,last),pool=[...new Set((savedTemplateVariants.template||[]).map(t=>t.trim()).filter(Boolean))];if(pool.every(t=>(used.template||[]).includes(t)))used.template=[];used.template=[...(used.template||[]),choice.text];last.template=choice.text;return [id,choice]})})())};
   return initialBatchPlan.messages;
 }
 function composeUsesVariants(){return document.getElementById('composeTemplateMode').value==='random'}
 function renderComposeVariantMode(){
   const random=composeUsesVariants(),editor=document.getElementById('template');editor.readOnly=random;editor.hidden=random;
   const heading=editor.previousElementSibling,tokens=editor.nextElementSibling;if(heading?.classList.contains('messagehead'))heading.hidden=random;if(tokens?.classList.contains('tokenrow'))tokens.hidden=random;document.getElementById('saveMessage').hidden=random;
-  document.getElementById('composeVariantHint').textContent=random?'Each recipient gets one random saved initial option. Use Preview to see their exact text; the choices stay fixed for this batch. Edit your saved options in Message templates.':'The custom text below will be used for every selected recipient.';
+  document.getElementById('composeVariantHint').textContent=random?'Each filled option is used once in a shuffled cycle before any option repeats. Use Preview to see their exact text; the choices stay fixed for this batch. Edit your saved options in Message templates.':'The custom text below will be used for every selected recipient.';
   document.getElementById('previewBox').hidden=true;
 }
 document.addEventListener('DOMContentLoaded',()=>{

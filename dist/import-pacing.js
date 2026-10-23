@@ -3,26 +3,19 @@ let pendingSendStopped=false;
 function beginPacedAction(){pendingSendStopped=false}
 function finishPacedAction(){document.querySelectorAll('[data-send-progress]').forEach(e=>e.textContent='');document.querySelectorAll('[data-stop-pending]').forEach(e=>e.hidden=true)}
 function showSendWait(text){document.querySelectorAll('[data-send-progress]').forEach(e=>e.textContent=text);document.querySelectorAll('[data-stop-pending]').forEach(e=>e.hidden=false)}
-async function waitForSend(seconds,account){
-  const until=Date.now()+seconds*1000;
-  while(Date.now()<until){
-    if(pendingSendStopped)throw Error('Pending sends stopped. Messages already delivered are kept.');
-    const left=Math.ceil((until-Date.now())/1000);
-    showSendWait('Account '+account+' · next message in '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0')+' · keep this page open.');
-    await new Promise(resolve=>setTimeout(resolve,Math.min(1000,until-Date.now())));
-  }
-  if(pendingSendStopped)throw Error('Pending sends stopped.');
-}
 async function api(path,body){
-  const sends=['/send','/follow-up','/sheet-send'].includes(path);
+  const sends=['/send','/follow-up','/sheet-send','/conversation/reply'].includes(path);
   if(sends&&!serverFeatures.send_pacing)throw Error('Deploy the latest WMM backend on Render before sending. This version requires server-enforced message delays.');
-  while(true){
-    if(sends&&pendingSendStopped)throw Error('Pending sends stopped.');
-    try{return await rawApi(path,body)}catch(error){
-      if(!sends||error.code!=='send_cooldown')throw error;
-      const account=error.accountId||body?.account_id||deliveries.find(d=>d.delivery_id===body?.delivery_id)?.account_id||sender();
-      await waitForSend(Math.max(1,Number(error.retryAfter)||120),account);
-    }
+  if(sends&&pendingSendStopped)throw Error('Pending sends stopped.');
+  const choices=sends&&path!=='/sheet-send'?messageTemplateChoices(path,body):{};
+  const request=sends?{...body,template_choices:choices}:body;
+  try{const result=await rawApi(path,request);if(sends)recordTemplateChoices(choices);return result}
+  catch(error){
+    if(!sends||error.code!=='send_cooldown')throw error;
+    if(!serverFeatures.background_sends)throw Error('Deploy the latest WMM backend on Render for background sending. This message was not queued; reopen its preview after deployment.');
+    if(path==='/sheet-send')throw error;
+    const result=await rawApi('/send-queue',{request_id:uniqueRequest(),action:path==='/conversation/reply'?'reply':path==='/follow-up'?'follow-up':'send',payload:request});
+    recordTemplateChoices(choices);await refreshQueuedSends();return result;
   }
 }
 function renderPacingSetup(settings){
@@ -62,7 +55,7 @@ async function previewImportSheet(){
   document.getElementById('confirmImport').disabled=!d.ready;
 }
 document.addEventListener('DOMContentLoaded',()=>{
-  document.querySelectorAll('[data-stop-pending]').forEach(b=>b.onclick=()=>{pendingSendStopped=true;showSendWait('Stopping pending sends… An in-flight message may still finish.');document.querySelectorAll('[data-stop-pending]').forEach(e=>e.hidden=true)});
+  document.querySelectorAll('[data-stop-pending]').forEach(b=>b.onclick=async()=>{pendingSendStopped=true;if(serverFeatures.background_sends){await rawApi('/send-queue/cancel',{});await refreshQueuedSends()}showSendWait('Pending sends stopped. A message already in flight may finish.');document.querySelectorAll('[data-stop-pending]').forEach(e=>e.hidden=true)});
   document.getElementById('saveSendDelay').onclick=()=>action(document.getElementById('saveSendDelay'),async()=>{await api('/sending-pace',{delay_seconds:Number(document.getElementById('sendDelay').value)});await refresh(false);toast('Sending delay saved for all accounts. Existing cooldowns are preserved.');});
   document.getElementById('openImport').onclick=()=>{clearImportPreview();document.getElementById('importDialog').showModal()};
   document.getElementById('closeImport').onclick=()=>{if(!busy)document.getElementById('importDialog').close()};

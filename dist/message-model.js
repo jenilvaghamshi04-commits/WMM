@@ -19,7 +19,7 @@
   function summarize(rows){
     rows=latestFirst(rows);
     const sent=rows.filter(d=>d.status==='Sent'),pending=rows.some(d=>d.status==='Sending'||d.status==='Uncertain');
-    return {rows,sent,latest:rows[0]||null,lastSent:sent[0]||null,firstMessage:sent.filter(d=>!d.followup_of).at(-1)||rows.at(-1)||null,lastFollowup:sent.find(d=>d.followup_of)||null,followups:sent.filter(d=>!!d.followup_of).length,canSend:sent.length===0&&!pending,canFollowup:sent.length>0&&!pending,pending};
+    return {rows,sent,latest:rows[0]||null,lastSent:sent[0]||null,firstMessage:sent.filter(d=>!d.followup_of).at(-1)||rows.at(-1)||null,lastFollowup:sent.find(d=>d.followup_of&&!d.conversation_reply)||null,followups:sent.filter(d=>!!d.followup_of&&!d.conversation_reply).length,canSend:sent.length===0&&!pending,canFollowup:sent.length>0&&!pending,pending};
   }
   function conversation(contact,history){
     const k=type(contact),target=String(k==='group'?contact.group_id:contact.user_id);
@@ -39,10 +39,10 @@
     const symbol=normalizeToken(tokenSymbol),handle=contact.username?'@'+String(contact.username).replace(/^@+/,''):(contact.name||'there');
     return String(text||'').replaceAll('@{{username}}',handle).replaceAll('{{username}}',handle).replaceAll('@username',handle).replaceAll('{{name}}',contact.name||'').replaceAll('{{role}}',contact.role||'').replaceAll('{{group}}',contact.group||'').replaceAll('{{token}}',symbol?'$'+symbol:'$TOKEN').replace(/[$@]TOKEN\b/g,symbol?'$'+symbol:'$TOKEN').replaceAll('{{exchange}}',exchanges[exchange]||exchange||'{{exchange}}');
   }
-  function status(summary){const d=summary.latest;if(!d)return 'Not sent';if(d.status==='Sending')return 'Sending';if(d.status==='Uncertain')return 'Delivery needs review';if(d.followup_of)return d.status==='Sent'?'Follow-up sent':'Follow-up '+d.status.toLowerCase();return d.status==='Sent'?'Message sent':d.status}
+  function status(summary){const d=summary.latest;if(!d)return 'Not sent';if(d.status==='Sending')return 'Sending';if(d.status==='Uncertain')return 'Delivery needs review';if(d.conversation_reply)return d.status==='Sent'?'Reply sent':'Reply '+d.status.toLowerCase();if(d.followup_of)return d.status==='Sent'?'Follow-up sent':'Follow-up '+d.status.toLowerCase();return d.status==='Sent'?'Message sent':d.status}
   function deliveryStates(summary){
     function state(isFollowup){
-      const rows=summary.rows.filter(d=>!!d.followup_of===isFollowup),confirmed=rows.some(d=>d.status==='Sent'),latest=rows[0];
+      const rows=summary.rows.filter(d=>!d.conversation_reply&&!!d.followup_of===isFollowup),confirmed=rows.some(d=>d.status==='Sent'),latest=rows[0];
       return {label:confirmed?'Sent':'Not sent',sent:confirmed,detail:latest&&latest.status!=='Sent'?latest.status==='Uncertain'?'Delivery uncertain · check Telegram':latest.status==='Sending'?'Sending · awaiting confirmation':latest.status+(latest.error?' · '+latest.error:''):''};
     }
     return {message:state(false),followup:state(true)};

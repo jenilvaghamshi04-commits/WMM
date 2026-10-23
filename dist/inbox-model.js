@@ -18,7 +18,7 @@
       if((delivery.kind||'dm')!=='dm')continue;
       const thread=threads.get(key(delivery.principal,delivery.target));if(!thread)continue;
       const did='send:'+delivery.delivery_id;if(thread.seen.has(did))continue;thread.seen.add(did);
-      thread.messages.push({key:did,direction:'sent',body:delivery.message||'Message text is unavailable for this older record.',at:delivery.at,account_id:delivery.account_id,sender_label:delivery.sender_label,status:delivery.status,error:delivery.error,automation_step:delivery.automation_step,followup_of:delivery.followup_of});
+      thread.messages.push({key:did,delivery_id:delivery.delivery_id,token_symbol:delivery.token_symbol,exchange:delivery.exchange,conversation_reply:delivery.conversation_reply,direction:'sent',body:delivery.message||'Message text is unavailable for this older record.',at:delivery.at,account_id:delivery.account_id,sender_label:delivery.sender_label,status:delivery.status,error:delivery.error,automation_step:delivery.automation_step,followup_of:delivery.followup_of});
     }
     return [...threads.values()].map(thread=>{
       thread.messages.sort((a,b)=>time(a.at)-time(b.at)||a.key.localeCompare(b.key));

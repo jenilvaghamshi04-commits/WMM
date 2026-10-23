@@ -17,9 +17,9 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.10')
+app=FastAPI(title='WMM Team',version='3.11')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
-lock=asyncio.Lock();login_pending={};qr_logins={};clients={};startup_errors={};reply_task=None;geo_task=None;geo_lock=asyncio.Lock();folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
+lock=asyncio.Lock();login_pending={};qr_logins={};clients={};startup_errors={};reply_task=None;geo_task=None;geo_lock=asyncio.Lock();folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock();manual_queue_task=None;manual_queue_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
 db.execute('create table if not exists location_profiles(key text primary key,data text)')
 db.execute('create table if not exists country_lookup_queue(key text primary key,contact_id text,slot integer,principal text,next_attempt_at text,last_checked_at text,error text)')
@@ -33,10 +33,13 @@ db.execute('create table if not exists quota_resets(id text primary key, princip
 db.execute('create table if not exists dashboard_sessions(token_hash text primary key, username text, expires_at text)')
 db.execute('create table if not exists login_failures(client_hash text, at text)')
 db.execute('create table if not exists message_details(delivery_id text primary key, body text, recipient_name text, username text, sender_label text, followup_of text)')
+if 'conversation_reply' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column conversation_reply integer not null default 0")
 if 'token_symbol' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column token_symbol text not null default ''")
 db.execute('create table if not exists followup_requests(request_id text primary key, delivery_id text, parent_id text, message_hash text)')
 db.execute('create table if not exists send_pacing(principal text primary key,last_attempt_at text)')
 db.execute('create table if not exists import_batches(id text primary key,data text,expires_at text)')
+db.execute('create table if not exists template_rotation(key text primary key,data text)')
+db.execute('create table if not exists manual_send_queue(id text primary key,request_id text unique,principal text,slot integer,contact_id text,kind text,target text,payload text,status text,created_at text,next_attempt_at text,error text)')
 db.execute('create table if not exists meta(key text primary key, value text)')
 db.execute('create table if not exists workspace_reset_requests(request_id text primary key,result text)')
 if 'telegram_message_id' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column telegram_message_id integer not null default 0")
@@ -124,14 +127,34 @@ def settings():
     existing=cfg.get('template_variants') or {}
     cfg['template_variants']={key:(list(existing[key])+['']*5)[:5] if key in existing else [cfg[key],'','','',''] for key in TEMPLATE_KEYS}
     return cfg
-def choose_template(key,cfg=None,chosen=None):
+def rotation_options(key,cfg):
+    choices=list(dict.fromkeys(t.strip() for t in cfg['template_variants'][key] if t.strip()))
+    row=db.execute('select data from template_rotation where key=?',(key,)).fetchone();state=json.loads(row[0]) if row else {}
+    used=[t for t in state.get('used',[]) if t in choices];remaining=[t for t in choices if t not in used]
+    if not remaining:used=[];remaining=choices[:]
+    if not used and len(remaining)>1:remaining=[t for t in remaining if t!=state.get('last')]
+    return choices,used,remaining,state.get('last','')
+def rotation_status(cfg):
+    return {key:{'used':rotation_options(key,cfg)[1],'available':rotation_options(key,cfg)[2],'last':rotation_options(key,cfg)[3]} for key in TEMPLATE_KEYS}
+def reserve_template_choices(chosen,cfg=None):
+    cfg=cfg or settings()
+    for key,text in (chosen or {}).items():
+        if key not in TEMPLATE_KEYS:raise HTTPException(400,'Unknown template type.')
+        choices,used,remaining,last=rotation_options(key,cfg)
+        if text not in choices:raise HTTPException(409,'This saved option changed. Reopen the preview.')
+        if text not in remaining:raise HTTPException(409,'This option was already used in the current rotation. Refresh and preview an unused option before sending.')
+        db.execute('insert or replace into template_rotation values(?,?)',(key,json.dumps({'used':used+[text],'last':text})))
+def choose_template(key,cfg=None,chosen=None,consume=True):
     cfg=cfg or settings()
     choices=[text.strip() for text in cfg['template_variants'][key] if text.strip()]
     if not choices:raise HTTPException(400,'Add at least one message option for '+key+' in Message templates.')
     if chosen is not None:
         if chosen not in choices:raise HTTPException(409,'A selected automatic message option has changed. Reopen the message preview before sending.')
         return chosen
-    return secrets.choice(choices)
+    selected=secrets.choice(rotation_options(key,cfg)[2])
+    if consume:
+        with db:reserve_template_choices({key:selected},cfg)
+    return selected
 def pacing_status(principal):
     row=db.execute('select last_attempt_at from send_pacing where principal=?',(principal,)).fetchone()
     # Cover deliveries made before the pacing migration too.
@@ -355,9 +378,9 @@ def records():
     keys=['delivery_id','principal','account_id','kind','target','id','status','day','at','error','message_hash']
     result=[]
     for r in db.execute('select * from outbox order by at desc').fetchall():
-        d=dict(zip(keys,r));detail=db.execute('select body,recipient_name,username,sender_label,followup_of,token_symbol,exchange,automation_step from message_details where delivery_id=?',(d['delivery_id'],)).fetchone()
+        d=dict(zip(keys,r));detail=db.execute('select body,recipient_name,username,sender_label,followup_of,token_symbol,exchange,automation_step,conversation_reply from message_details where delivery_id=?',(d['delivery_id'],)).fetchone()
         saved=db.execute('select data from contacts where id=?',(d['id'],)).fetchone();contact=json.loads(saved[0]) if saved else {}
-        d.update(dict(zip(['message','recipient_name','username','sender_label','followup_of','token_symbol','exchange','automation_step'],detail)) if detail else {'message':None,'recipient_name':contact.get('name',d['target']),'username':contact.get('username',''),'sender_label':f"Account {d['account_id']}",'followup_of':None,'token_symbol':'','exchange':'','automation_step':0})
+        d.update(dict(zip(['message','recipient_name','username','sender_label','followup_of','token_symbol','exchange','automation_step','conversation_reply'],detail)) if detail else {'message':None,'recipient_name':contact.get('name',d['target']),'username':contact.get('username',''),'sender_label':f"Account {d['account_id']}",'followup_of':None,'token_symbol':'','exchange':'','automation_step':0})
         d['location']=location_for(d['kind']+':'+str(d['target']))
         result.append(d)
     return result
@@ -819,13 +842,14 @@ async def auto_followup_loop():
 
 @app.on_event('startup')
 async def start():
-    global reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task
-    seed_folder_routes();seed_auto_followups();seed_country_checks()
+    global reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task,manual_queue_task
+    recover_manual_queue();seed_folder_routes();seed_auto_followups();seed_country_checks()
     for slot in (1,2,3):
         try:
             c=make_client(slot)
             if c:clients[slot]=c;await c.connect()
         except Exception:startup_errors[slot]='Telegram connection unavailable. Reconnect this account in Connections.'
+    manual_queue_task=asyncio.create_task(manual_send_loop())
     geo_task=asyncio.create_task(country_check_loop())
     reply_task=asyncio.create_task(reply_sync_loop())
     folder_task=asyncio.create_task(folder_routing_loop())
@@ -838,7 +862,7 @@ async def stop():
     for task in qr_tasks:
         try:await task
         except asyncio.CancelledError:pass
-    for task in (reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task):
+    for task in (reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task,manual_queue_task):
         if task:
             task.cancel()
             try:await task
@@ -866,9 +890,12 @@ class Templates(BaseModel):
     auto_yes_enabled:bool|None=None
     auto_followup_enabled:bool|None=None
     template_variants:dict[str,list[str]]|None=None
-class Send(Account):id:str;kind:Literal['dm','group']='dm';message:str|None=None;token_symbol:str|None=Field(default=None,max_length=33);exchange:str=Field(default='',max_length=64);auto_yes:bool=False;auto_reply_templates:dict[str,str]|None=None
+class Send(Account):
+    template_choices:dict[str,str]|None=None
+    id:str;kind:Literal['dm','group']='dm';message:str|None=None;token_symbol:str|None=Field(default=None,max_length=33);exchange:str=Field(default='',max_length=64);auto_yes:bool=False;auto_reply_templates:dict[str,str]|None=None
 class SheetSend(BaseModel):id:str
 class Followup(BaseModel):
+    template_choices:dict[str,str]|None=None
     token_symbol:str|None=Field(default=None,max_length=33)
     delivery_id:str
     message:str=Field(min_length=1,max_length=4096)
@@ -880,7 +907,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.10'},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.11'},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -915,12 +942,12 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
-    return {'version':'3.10','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True}}
+    return {'version':'3.11','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
-WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue')
+WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue','manual_send_queue','template_rotation')
 def workspace_reset_counts():
     count=lambda table:db.execute('select count(*) from '+table).fetchone()[0]
-    return {'contacts':count('contacts'),'messages':count('outbox'),'replies':count('replies'),'leads':len(lead_records()),'automations':count('auto_yes_jobs')+count('auto_yes_enrollments')+count('auto_followup_jobs')}
+    return {'contacts':count('contacts'),'messages':count('outbox'),'replies':count('replies'),'leads':len(lead_records()),'automations':count('auto_yes_jobs')+count('auto_yes_enrollments')+count('auto_followup_jobs')+count('manual_send_queue')}
 class WorkspaceReset(BaseModel):
     confirmation:Literal['RESET DATA']
     request_id:str=Field(min_length=8,max_length=128)
@@ -1255,7 +1282,7 @@ def personalize_message(text,contact,token_symbol='',exchange=''):
     text=text.replace('{{token}}','$'+symbol if symbol else '')
     return re.sub(r'[$@]TOKEN\b',lambda match:'$'+symbol,text)
 
-async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=None,expected_principal=None,token_symbol=None,exchange='',auto_yes=False,automation_job=None,automation_step=0,automatic_followup=None,auto_reply_templates=None):
+async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=None,expected_principal=None,token_symbol=None,exchange='',auto_yes=False,automation_job=None,automation_step=0,automatic_followup=None,auto_reply_templates=None,queued_send=None,template_choices=None,conversation_reply=False):
     async with lock:
         c=await ready(slot);principal=await identify(slot,c)
         row=db.execute('select data from contacts where id=?',(cid,)).fetchone()
@@ -1265,6 +1292,15 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if expected_principal and expected_principal!=principal:raise HTTPException(409,'The original sender is not logged into this account slot. Reconnect the original Telegram account to send this follow-up.')
         if (kind=='group') != (contact.get('kind')=='group'):raise HTTPException(400,'Choose a group chat for group messages or a team member for DMs')
         if kind=='group' and contact.get('membership',{}).get(str(slot))=='left':raise HTTPException(409,f'Account {slot} left this group. Rejoin and rescan with Leave group after scan switched off before sending group messages.')
+        original_target=str(contact.get('group_id') if kind=='group' else contact.get('user_id'))
+        if queued_send:
+            job=db.execute('select principal,target,status from manual_send_queue where id=?',(queued_send,)).fetchone()
+            if not job or job!=(principal,original_target,'Sending'):raise HTTPException(409,'This queued send was cancelled or its recipient changed.')
+            if followup_of and kind=='dm' and not conversation_reply:
+                if db.execute('select 1 from replies where target=? limit 1',(original_target,)).fetchone() or lead_config('dm:'+original_target)['stage'] in ('Replied','Meeting','Proposal','Client'):raise HTTPException(409,'Follow-up cancelled because a reply arrived or the lead progressed.')
+                sync=db.execute('select checked_at,complete,error from reply_sync where principal=? and target=?',(principal,original_target)).fetchone()
+                if not sync or not sync[1] or sync[2] or datetime.now(timezone.utc)-datetime.fromisoformat(sync[0])>timedelta(minutes=2):raise HTTPException(409,'Reply history could not be confirmed before the queued follow-up.')
+        elif db.execute("select 1 from manual_send_queue where kind=? and target=? and status in ('Queued','Sending')",(kind,original_target)).fetchone():raise HTTPException(409,'This recipient already has a pending send. Review or cancel it in Pending sends.')
         resolved_peer=None
         if contact.get('import_unresolved'):
             pause=db.execute('select blocked_until from account_info where slot=?',(slot,)).fetchone()
@@ -1280,7 +1316,9 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             field='group_id' if kind=='group' else 'user_id'
             contact[field]=str(utils.get_peer_id(resolved) if kind=='group' else resolved.id)
             contact['import_unresolved']=False;migrate_location(old_geo_key,geo_key(contact));save(contact);resolved_peer=resolved
-        text=(message if message is not None else choose_template('template')).strip()
+        text=(message if message is not None else choose_template('template',consume=False)).strip()
+        used_choices=dict(template_choices or {})
+        if message is None:used_choices['template']=text
         if not text:raise HTTPException(400,'Write your message before sending')
         symbol=normalize_token(settings().get('token_symbol','') if token_symbol is None else token_symbol)
         exchange=normalize_exchange(exchange)
@@ -1299,9 +1337,13 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             if not exchange or not symbol:raise HTTPException(400,'Select the exchange and enter the token to enable automatic replies')
             if auto_reply_templates is not None and set(auto_reply_templates)-{'no_reply_template'}!={'yes_pitch_template','yes_demo_template'}:raise HTTPException(400,'Provide both affirmative reply previews.')
             for key in ('yes_pitch_template','yes_demo_template'):
-                yes_cfg[key]=choose_template(key,yes_cfg,auto_reply_templates[key] if auto_reply_templates else None)
+                yes_cfg[key]=(auto_reply_templates[key] if queued_send and auto_reply_templates else choose_template(key,yes_cfg,auto_reply_templates[key] if auto_reply_templates else None,consume=False))
+                if not queued_send:used_choices[key]=yes_cfg[key]
             personalize_message(yes_cfg['yes_pitch_template'],contact,symbol,exchange)
             personalize_message(yes_cfg['yes_demo_template'],contact,symbol,exchange)
+        for key,chosen in used_choices.items():
+            expected=(yes_cfg or {}).get(key) if key.startswith('yes_') else text
+            if chosen!=expected:raise HTTPException(400,'Template choice does not match the reviewed message.')
         text=personalize_message(text,contact,symbol,exchange)
         digest=hashlib.sha256(text.encode()).hexdigest()
         target=str(contact['group_id'] if kind=='group' else contact['user_id'])
@@ -1338,13 +1380,14 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if kind=='dm':observe_public_phone(contact,peer)
         if kind=='dm' and getattr(peer,'bot',False):raise HTTPException(400,'This contact is a Telegram bot. Bot admins are excluded.')
         if kind=='group' and not (isinstance(peer,types.Chat) or getattr(peer,'megagroup',False)):raise HTTPException(400,'The selected destination is not a group chat')
-        delivery_id=uuid.uuid4().hex
+        delivery_id='queued:'+queued_send if queued_send else uuid.uuid4().hex
         # Record all attempts. DM quota counts unique new recipients; group quota counts attempts.
         sender_label=db.execute('select label from account_info where slot=?',(slot,)).fetchone()[0]
         with db:
+            if not queued_send:reserve_template_choices(used_choices)
             db.execute('insert into outbox values(?,?,?,?,?,?,?,?,?,?,?)',(delivery_id,principal,slot,kind,target,cid,'Sending',date,stamp(),'',digest))
             db.execute('insert into message_details(delivery_id,body,recipient_name,username,sender_label,followup_of,token_symbol) values(?,?,?,?,?,?,?)',(delivery_id,text,contact['name'],contact.get('username',''),sender_label,followup_of,symbol))
-            db.execute('update message_details set exchange=?,automation_step=? where delivery_id=?',(exchange,automation_step,delivery_id))
+            db.execute('update message_details set exchange=?,automation_step=?,conversation_reply=? where delivery_id=?',(exchange,automation_step,int(conversation_reply),delivery_id))
             if followup_of:db.execute('insert into followup_requests values(?,?,?,?)',(request_id,delivery_id,followup_of,digest))
         db.execute('insert or replace into send_pacing values(?,?)',(principal,stamp()));db.commit()
         try:sent_message=await c.send_message(peer,text)
@@ -1366,18 +1409,131 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             if auto_yes:arm_auto_yes(principal,target,slot,delivery_id,cid,exchange,symbol,yes_cfg['yes_pitch_template'],yes_cfg['yes_demo_template'])
         return {'status':'Sent','id':cid,'account_id':slot,'kind':kind,'usage':usage(principal)}
 @app.post('/send',dependencies=[Depends(auth)])
-async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message,token_symbol=body.token_symbol,exchange=body.exchange,auto_yes=body.auto_yes,auto_reply_templates=body.auto_reply_templates)
+async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message,token_symbol=body.token_symbol,exchange=body.exchange,auto_yes=body.auto_yes,auto_reply_templates=body.auto_reply_templates,template_choices=body.template_choices)
 @app.post('/follow-up',dependencies=[Depends(auth)])
-async def follow_up(body:Followup):
+async def follow_up(body:Followup):return await send_conversation_message(body)
+@app.post('/conversation/reply',dependencies=[Depends(auth)])
+async def reply_to_conversation(body:Followup):return await send_conversation_message(body,True)
+async def send_conversation_message(body,conversation_reply=False):
     parent=db.execute('select principal,slot,kind,contact_id,status from outbox where id=?',(body.delivery_id,)).fetchone()
     if not parent:raise HTTPException(404,'Original message not found')
     principal,slot,kind,cid,status=parent
-    if status!='Sent':raise HTTPException(409,'Follow-ups require a confirmed sent message')
+    if status!='Sent':raise HTTPException(409,'Conversation messages require a confirmed original delivery')
+    if conversation_reply and kind!='dm':raise HTTPException(400,'Replies are available for direct-message conversations.')
     try:client,slot=await folder_client(principal,slot)
     except HTTPException:raise HTTPException(409,'Reconnect the original sender to send this follow-up. No other Telegram account will be used.')
     saved_token=db.execute('select token_symbol,exchange from message_details where delivery_id=?',(body.delivery_id,)).fetchone()
     symbol=body.token_symbol if body.token_symbol is not None else (saved_token[0] if saved_token else '')
-    return await deliver(cid,slot,kind,body.message,followup_of=body.delivery_id,request_id=body.request_id,expected_principal=principal,token_symbol=symbol,exchange=saved_token[1] if saved_token else '')
+    return await deliver(cid,slot,kind,body.message,followup_of=body.delivery_id,request_id=body.request_id,expected_principal=principal,token_symbol=symbol,exchange=saved_token[1] if saved_token else '',template_choices=body.template_choices,conversation_reply=conversation_reply)
+
+class QueueSend(BaseModel):
+    request_id:str=Field(min_length=8,max_length=128)
+    action:Literal['send','follow-up','reply']
+    payload:dict
+class QueueCancel(BaseModel):
+    id:str=''
+
+def queued_send_records():
+    rows=db.execute("select id,slot,contact_id,kind,target,status,created_at,next_attempt_at,error,payload from manual_send_queue order by created_at desc,rowid desc limit 250").fetchall();result=[]
+    for qid,slot,cid,kind,target,status,created,next_at,error,payload in rows:
+        data=json.loads(payload);current=db.execute('select data from contacts where id=?',(cid,)).fetchone();contact=json.loads(current[0]) if current else {}
+        result.append({'queue_id':qid,'account_id':slot,'contact_id':cid,'kind':kind,'target':target,'status':status,'created_at':created,'next_attempt_at':next_at,'error':error,'name':contact.get('name','Saved contact'),'message':data['message'],'followup':bool(data.get('followup_of'))})
+    return result
+
+def recover_manual_queue():
+    for qid in [r[0] for r in db.execute("select id from manual_send_queue where status='Sending'").fetchall()]:
+        attempt=db.execute('select status from outbox where id=?',('queued:'+qid,)).fetchone()
+        state='Sent' if attempt and attempt[0]=='Sent' else 'Needs attention' if attempt else 'Queued'
+        db.execute('update manual_send_queue set status=?,error=? where id=?',(state,'Server restarted; review delivery history before sending again.' if state=='Needs attention' else '',qid))
+    db.commit()
+
+@app.post('/send-queue',dependencies=[Depends(auth)])
+async def enqueue_send(body:QueueSend):
+    from pydantic import ValidationError
+    try:source=Send.model_validate(body.payload) if body.action=='send' else Followup.model_validate(body.payload)
+    except ValidationError:raise HTTPException(422,'The queued message request is incomplete or invalid.')
+    async with lock:
+        existing=db.execute('select id,payload,status,slot,contact_id from manual_send_queue where request_id=?',(body.request_id,)).fetchone()
+        fingerprint=hashlib.sha256(json.dumps([body.action,source.model_dump()],sort_keys=True).encode()).hexdigest()
+        if existing:
+            if json.loads(existing[1])['fingerprint']!=fingerprint:raise HTTPException(409,'Request ID already belongs to a different queued message.')
+            return {'status':existing[2],'queue_id':existing[0],'account_id':existing[3],'id':existing[4]}
+        parent_id=None
+        if body.action!='send':
+            parent=db.execute("select principal,slot,kind,contact_id,status,target from outbox where id=?",(source.delivery_id,)).fetchone()
+            if not parent or parent[4]!='Sent':raise HTTPException(409,'A follow-up needs a confirmed original delivery.')
+            principal,slot,kind,cid,_,target=parent;client,slot=await folder_client(principal,slot);parent_id=source.delivery_id
+            token_row=db.execute('select token_symbol,exchange from message_details where delivery_id=?',(parent_id,)).fetchone()
+            symbol=normalize_token(source.token_symbol if source.token_symbol is not None else token_row[0]);exchange=token_row[1]
+            if body.action=='reply' and kind!='dm':raise HTTPException(400,'Choose a DM conversation to reply.')
+            if body.action!='reply' and kind=='dm' and (db.execute('select 1 from replies where target=? limit 1',(target,)).fetchone() or lead_config('dm:'+target)['stage'] in ('Replied','Meeting','Proposal','Client')):raise HTTPException(409,'This contact has replied; follow-up was not queued.')
+        else:
+            slot=source.account_id;client=await ready(slot);principal=await identify(slot,client);kind=source.kind;cid=source.id
+            symbol=normalize_token(source.token_symbol if source.token_symbol is not None else settings().get('token_symbol',''));exchange=normalize_exchange(source.exchange)
+        record=db.execute('select data from contacts where id=?',(cid,)).fetchone()
+        if not record:raise HTTPException(404,'Saved contact not found.')
+        contact=json.loads(record[0]);target=str(contact.get('group_id') if kind=='group' else contact.get('user_id'))
+        if contact.get('is_bot') or (kind=='group')!=(contact.get('kind')=='group'):raise HTTPException(400,'Choose a person for DMs or a group for group messages; bots are excluded.')
+        if db.execute("select 1 from manual_send_queue where kind=? and target=? and status in ('Queued','Sending')",(kind,target)).fetchone():raise HTTPException(409,'This recipient already has a pending send.')
+        if not parent_id and db.execute("select 1 from outbox where kind=? and target=? and status in ('Sent','Sending','Uncertain')"+(" and day=?" if kind=='group' else ''),([kind,target,today()] if kind=='group' else [kind,target])).fetchone():raise HTTPException(409,'Already sent or awaiting review. Duplicate blocked.')
+        choices=dict(source.template_choices or {});raw=source.message if source.message is not None else choose_template('template',consume=False)
+        if source.message is None:choices['template']=raw
+        message=personalize_message(raw.strip(),contact,symbol,exchange)
+        if not message:raise HTTPException(400,'Write a message before queueing.')
+        auto=bool(body.action=='send' and source.auto_yes);auto_templates=None
+        if auto:
+            if kind!='dm' or not symbol or not exchange:raise HTTPException(400,'Automatic replies need a new DM, token and exchange.')
+            auto_templates={key:choose_template(key,chosen=(source.auto_reply_templates or {}).get(key),consume=False) for key in ('yes_pitch_template','yes_demo_template')}
+            for key,text in auto_templates.items():personalize_message(text,contact,symbol,exchange);choices[key]=text
+        for key,text in choices.items():
+            expected=(auto_templates or {}).get(key) if key.startswith('yes_') else raw
+            if text!=expected:raise HTTPException(400,'Template selection does not match the queued preview.')
+        payload={'fingerprint':fingerprint,'message':message,'followup_of':parent_id,'request_id':source.request_id if parent_id else None,'token_symbol':symbol,'exchange':exchange,'auto_yes':auto,'auto_reply_templates':auto_templates,'conversation_reply':body.action=='reply'}
+        qid=uuid.uuid4().hex;next_at=pacing_status(principal)['next_available_at'] or stamp()
+        with db:
+            reserve_template_choices(choices)
+            db.execute('insert into manual_send_queue values(?,?,?,?,?,?,?,?,?,?,?,?)',(qid,body.request_id,principal,slot,cid,kind,target,json.dumps(payload),'Queued',stamp(),next_at,''))
+        return {'status':'Queued','queue_id':qid,'id':cid,'account_id':slot,'next_attempt_at':next_at}
+
+@app.post('/send-queue/cancel',dependencies=[Depends(auth)])
+async def cancel_queued_send(body:QueueCancel):
+    async with lock:
+        with db:
+            cursor=db.execute("update manual_send_queue set status='Cancelled',error='Cancelled by you.' where status='Queued'"+(' and id=?' if body.id else ''),(body.id,) if body.id else ())
+        return {'ok':True,'cancelled':cursor.rowcount,'message':'Messages already being sent may finish.'}
+
+async def process_manual_queue(limit=3):
+    async with manual_queue_lock:
+        rows=db.execute("select id,principal,slot,contact_id,kind,target,payload from manual_send_queue where status='Queued' and next_attempt_at<=? order by created_at,rowid limit ?",(stamp(),limit)).fetchall();processed=0
+        for qid,principal,preferred,cid,kind,target,raw in rows:
+            data=json.loads(raw);state='Needs attention';error='';next_at=''
+            try:
+                try:client,slot=await folder_client(principal,preferred)
+                except HTTPException:
+                    db.execute("update manual_send_queue set error='Waiting for the original sender to reconnect.',next_attempt_at=? where id=? and status='Queued'",((datetime.now(timezone.utc)+timedelta(seconds=30)).isoformat(),qid));db.commit();continue
+                async with lock:
+                    claim=db.execute("update manual_send_queue set status='Sending',slot=? where id=? and status='Queued'",(slot,qid));db.commit()
+                    if not claim.rowcount:continue
+                if data['followup_of'] and kind=='dm' and not data.get('conversation_reply'):
+                    first=db.execute('select at from outbox where id=?',(data['followup_of'],)).fetchone()
+                    sync=await sync_reply_pair(principal,target,slot,first[0])
+                    if not sync.get('ok') or not sync.get('complete'):raise HTTPException(409,'Could not verify reply history. Review before sending this follow-up.')
+                await deliver(cid,slot,kind,data['message'],followup_of=data['followup_of'],request_id=data['request_id'],expected_principal=principal,token_symbol=data['token_symbol'],exchange=data['exchange'],auto_yes=data['auto_yes'],auto_reply_templates=data['auto_reply_templates'],queued_send=qid,conversation_reply=data.get('conversation_reply',False))
+                state='Sent'
+            except Exception as exc:
+                error=(exc.detail.get('message',str(exc.detail)) if isinstance(exc.detail,dict) else str(exc.detail)) if isinstance(exc,HTTPException) else 'Sending stopped. Review delivery history before retrying.'
+                attempt=db.execute('select status from outbox where id=?',('queued:'+qid,)).fetchone()
+                if not attempt and isinstance(exc,HTTPException) and isinstance(exc.detail,dict) and exc.detail.get('code')=='send_cooldown':state='Queued';next_at=exc.detail['next_available_at']
+                if attempt and attempt[0]=='Sent':state='Sent'
+            db.execute('update manual_send_queue set status=?,error=?,next_attempt_at=? where id=?',(state,error,next_at,qid));db.commit();processed+=1
+        return {'processed':processed}
+
+async def manual_send_loop():
+    while True:
+        await asyncio.sleep(2)
+        try:await process_manual_queue()
+        except asyncio.CancelledError:raise
+        except Exception:pass
 
 # Spreadsheet imports are staged for review; they never join chats or send messages.
 try:from backend import contact_import as importer
