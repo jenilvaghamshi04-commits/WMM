@@ -9,7 +9,7 @@ vm.runInContext('hydrateTemplateVariants(cfg);loadVariantEditors();',ctx);assert
 node('initialTemplateEditor').value='Edited one';vm.runInContext("updateVariantDraft('initial')",ctx);const drafts=vm.runInContext('readVariantDrafts()',ctx);assert.equal(drafts.template[0],'Edited one');assert.equal(drafts.template[4],'five');assert.equal(drafts.followup_template[0],'Follow');
 vm.runInContext("getInitialBatchPlan(['a','b'])",ctx);const original=vm.runInContext('initialBatchPlan',ctx);vm.runInContext('hydrateTemplateVariants(cfg)',ctx);assert.equal(vm.runInContext('initialBatchPlan',ctx),original);assert.equal(vm.runInContext("getInitialBatchPlan(['a','b'])",ctx),original.messages);
 ctx.cfg.template_variants.template[4]='changed';vm.runInContext('hydrateTemplateVariants(cfg)',ctx);assert.equal(vm.runInContext('initialBatchPlan',ctx),null);
-vm.runInContext("savedTemplateVariants.template=['','','','',''];chooseContactInitial()",ctx);assert.equal(node('contactMessageText').value,'Initial');
+assert.throws(()=>vm.runInContext("savedTemplateVariants.template=['','','','',''];chooseContactInitial()",ctx),/Add and save/);
 console.log('10 template variant UI checks passed: random boundaries, empty slots, defaults, independent drafts and stable preview plans.');
 ctx.cfg.template_variants.template=['one','two','three','four','five'];ctx.cfg.template_rotation={template:{used:[],last:''}};
 vm.runInContext('hydrateTemplateVariants(cfg)',ctx);

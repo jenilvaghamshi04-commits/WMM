@@ -15,8 +15,23 @@ function hydrateTemplateVariants(cfg){
   for(const [,key,fallback] of templateFields)savedTemplateVariants[key]=WMMTemplateVariants.normalize(cfg.template_variants?.[key],cfg[key]||WMMMessageModel[fallback]);
   if(previous!==JSON.stringify(savedTemplateVariants))initialBatchPlan=null;
 }
+async function refreshTemplateCatalog(){
+  if(!live)throw Error('Connect your gateway first.');
+  try{hydrateTemplateVariants(await rawApi('/templates'))}
+  catch(error){if(error.status===404||error.status===405)await refresh(false);else throw error}
+}
+function isTemplateConflict(error){return error.status===409&&/saved option changed|option was already used|selected automatic message option has changed/i.test(error.message)}
+async function recoverTemplatePreview(error){
+  if(!isTemplateConflict(error))return false;
+  await refreshTemplateCatalog();initialBatchPlan=null;
+  const contact=document.getElementById('contactMessageDialog'),followup=document.getElementById('followupDialog');
+  if(contact?.open){if(document.getElementById('contactMessageFormat').value==='saved')chooseContactInitial();if(document.getElementById('contactAutoReply').checked)chooseContactAutoTemplates();updateContactPreview()}
+  if(followup?.open){chooseFollowupTemplate();updateFollowupPreview()}
+  toast('Saved options updated. Review the new preview, then send again.');return true;
+}
 function pickSavedTemplate(key,used=templateRotationUsed,last=templateRotationLast){
-  const options=savedTemplateVariants[key]?.some(text=>text.trim())?savedTemplateVariants[key]:[legacyTemplateValue(key)];
+  const options=savedTemplateVariants[key]||[];
+  if(!options.some(text=>text.trim()))throw Error('Add and save at least one option for this message type in Message templates.');
   const unique=[...new Set(options.map(t=>t.trim()).filter(Boolean))],seen=used[key]||[];let available=unique.filter(t=>!seen.includes(t));
   if(!available.length)available=unique.slice();
   if((!seen.length||unique.every(t=>seen.includes(t)))&&available.length>1)available=available.filter(t=>t!==last[key]);
@@ -78,7 +93,7 @@ function chooseFollowupTemplate(){
   document.getElementById('followupVariantChoice').textContent='Random follow-up · option '+(choice.index+1)+' selected. Review or edit it before sending.';
 }
 function getInitialBatchPlan(ids){
-  const signature=JSON.stringify([ids,savedTemplateVariants.template||[legacyTemplateValue('template')]]);
+  const signature=JSON.stringify([ids,savedTemplateVariants.template,templateRotationUsed.template,templateRotationLast.template]);
   if(!initialBatchPlan||initialBatchPlan.signature!==signature)initialBatchPlan={signature,messages:new Map((()=>{const used=JSON.parse(JSON.stringify(templateRotationUsed)),last={...templateRotationLast};return ids.map(id=>{const choice=pickSavedTemplate('template',used,last),pool=[...new Set((savedTemplateVariants.template||[]).map(t=>t.trim()).filter(Boolean))];if(pool.every(t=>(used.template||[]).includes(t)))used.template=[];used.template=[...(used.template||[]),choice.text];last.template=choice.text;return [id,choice]})})())};
   return initialBatchPlan.messages;
 }

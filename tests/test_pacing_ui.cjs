@@ -1,7 +1,7 @@
 const assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
 const script=fs.readFileSync('dist/import-pacing.js','utf8');
 function setup({active=true,background=true,response}={}){
- let calls=[],recorded=[],refreshes=0;const ctx=vm.createContext({document:{addEventListener(){},querySelectorAll:()=>[]},Math,Number,String,Promise,Error,uniqueRequest:()=> 'queue-test-id',serverFeatures:{send_pacing:active,background_sends:background},messageTemplateChoices:()=>({template:'Reviewed text'}),recordTemplateChoices:c=>recorded.push(c),refreshQueuedSends:async()=>{refreshes++},rawApi:async(path,body)=>{calls.push({path,body});return response?response(calls.length,path,body):{status:'Sent'}}});vm.runInContext(script,ctx);return {ctx,calls,recorded,get refreshes(){return refreshes}};
+ let calls=[],recorded=[],refreshes=0;const ctx=vm.createContext({document:{addEventListener(){},querySelectorAll:()=>[]},Math,Number,String,Promise,Error,uniqueRequest:()=> 'queue-test-id',serverFeatures:{send_pacing:active,background_sends:background},recoverTemplatePreview:async()=>false,messageTemplateChoices:()=>({template:'Reviewed text'}),recordTemplateChoices:c=>recorded.push(c),refreshQueuedSends:async()=>{refreshes++},rawApi:async(path,body)=>{calls.push({path,body});return response?response(calls.length,path,body):{status:'Sent'}}});vm.runInContext(script,ctx);return {ctx,calls,recorded,get refreshes(){return refreshes}};
 }
 (async()=>{
  const original={id:'lead',account_id:1,message:'Reviewed text'},s=setup({response:n=>{if(n===1)throw Object.assign(Error('Wait'),{code:'send_cooldown',retryAfter:120});return {status:'Queued'}}});s.ctx.body=original;

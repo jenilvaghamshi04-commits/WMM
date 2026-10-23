@@ -1,6 +1,6 @@
 // Reviewed admin selection; messages are queued only by the confirmation button.
 let tgAdminSelected=new Set(),tgAdminBatchPlan=null;
-function tgAdminSource(){return serverFeatures.group_admin_directory?groupAdminSnapshots:legacyGroupAdminSnapshots()}
+function tgAdminSource(){return newGroupAdminSnapshots()}
 function tgAdminContact(admin,group){const list=people.filter(p=>(p.kind||'dm')==='dm'&&!p.is_bot&&String(p.user_id)===String(admin.user_id));return list.find(p=>p.group_id===group.group_id)||list[0]}
 function tgAdminState(contact){
  if(!contact)return 'Load this real admin first';
@@ -35,7 +35,8 @@ function tgBatchReady(){
  const recipients=tgAdminRecipients();if(!recipients.length||recipients.length>15)throw Error('Select between 1 and 15 real admins.');return {id,recipients};
 }
 function invalidateTgBatchPreview(){tgAdminBatchPlan=null;document.getElementById('tgBatchPreviews').hidden=true;document.getElementById('tgBatchConfirm').disabled=true;document.getElementById('tgBatchState').textContent='Review the messages before queueing.'}
-function openTgAdminBatch(){
+async function openTgAdminBatch(){
+ await refreshTemplateCatalog();
  const {id,recipients}=tgBatchReady();invalidateTgBatchPreview();
  document.getElementById('tgBatchSummary').textContent=recipients.length+' admins · Account '+id+' · minimum '+tgBatchGap()/60+' minutes between messages';
  document.getElementById('tgBatchToken').value=document.getElementById('composeToken').value;
@@ -60,15 +61,15 @@ function initializeAdminBatch(){
  document.getElementById('tgGroupRecords').onchange=event=>{const input=event.target;if(!input.matches('[data-tg-admin-select]'))return;const uid=input.dataset.tgAdminSelect;if(input.checked){if(tgAdminSelected.size>=15){input.checked=false;toast('Select up to 15 admins per batch.');return}tgAdminSelected.add(uid)}else tgAdminSelected.delete(uid);invalidateTgBatchPreview();renderGroupAdmins()};
  document.getElementById('tgBulkClear').onclick=()=>{tgAdminSelected.clear();invalidateTgBatchPreview();renderGroupAdmins()};
  document.getElementById('tgBulkSender').onchange=()=>{invalidateTgBatchPreview();renderAdminBatchBar()};document.getElementById('tgBulkDelay').onchange=()=>{invalidateTgBatchPreview();renderAdminBatchBar()};
- document.getElementById('tgBulkOpen').onclick=()=>{try{openTgAdminBatch()}catch(error){toast(error.message)}};
+ document.getElementById('tgBulkOpen').onclick=()=>action(document.getElementById('tgBulkOpen'),()=>openTgAdminBatch());
  document.getElementById('tgBatchCancel').onclick=()=>{if(!busy)document.getElementById('tgAdminBatchDialog').close()};document.getElementById('tgAdminBatchDialog').addEventListener('cancel',e=>{if(busy)e.preventDefault()});
  document.getElementById('tgBatchFormat').onchange=()=>{document.getElementById('tgBatchMessage').hidden=document.getElementById('tgBatchFormat').value==='random';invalidateTgBatchPreview()};
  for(const id of ['tgBatchToken','tgBatchExchange','tgBatchMessage'])document.getElementById(id).oninput=invalidateTgBatchPreview;
- document.getElementById('tgBatchReview').onclick=()=>{try{buildTgAdminBatchPreview()}catch(error){document.getElementById('tgBatchState').textContent=error.message;toast(error.message)}};
+ document.getElementById('tgBatchReview').onclick=()=>action(document.getElementById('tgBatchReview'),async()=>{await refreshTemplateCatalog();buildTgAdminBatchPreview()});
  document.getElementById('tgBatchConfirm').onclick=()=>action(document.getElementById('tgBatchConfirm'),async()=>{
   const {id}=tgBatchReady();if(!tgAdminBatchPlan||tgAdminBatchPlan.body.account_id!==id)throw Error('Review the messages first.');
   document.getElementById('tgBatchState').textContent='Saving your reviewed batch…';
   try{const result=await rawApi('/groups/admins/send-batch',tgAdminBatchPlan.body);tgAdminSelected.clear();tgAdminBatchPlan=null;document.getElementById('tgAdminBatchDialog').close();try{await refresh(false)}catch{}renderGroupAdmins();toast(result.count+' messages queued · Account '+result.account_id+' · at least '+result.delay_seconds/60+' minutes apart. You can close this tab.');}
-  catch(error){document.getElementById('tgBatchState').textContent=error.name==='AbortError'?'Connection timed out. Check Pending sends before changing this preview. Retrying this unchanged batch uses the same request ID.':error.message;try{await refresh(false)}catch{}throw error}
+  catch(error){if(isTemplateConflict(error)){await refreshTemplateCatalog();invalidateTgBatchPreview();buildTgAdminBatchPreview();document.getElementById('tgBatchState').textContent='Saved options updated. Review the new previews, then queue again.';toast('Saved options updated. Review the new previews, then queue again.');return}document.getElementById('tgBatchState').textContent=error.name==='AbortError'?'Connection timed out. Check Pending sends before changing this preview. Retrying this unchanged batch uses the same request ID.':error.message;try{await refresh(false)}catch{}throw error}
  });
 }

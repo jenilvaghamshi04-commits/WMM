@@ -57,7 +57,7 @@ class GroupAdminsTests(unittest.TestCase):
             for entity in [types.User(10),types.Channel(77,'Joined',types.ChatPhotoEmpty(),None,megagroup=True,username='joined'),types.Channel(78,'Left',types.ChatPhotoEmpty(),None,left=True),types.Chat(79,'Basic',types.ChatPhotoEmpty(),1,None,1)]:yield SimpleNamespace(entity=entity)
         c.iter_dialogs=dialogs
         result=self.run_async(self.app.joined_groups(self.app.Account(account_id=1)));self.assertEqual(len(result['groups']),2);self.assertFalse(result['cached'])
-        self.assertEqual(self.run_async(self.app.joined_groups(self.app.Account(account_id=1)))['groups'],result['groups']);self.assertEqual(len(calls),1)
+        self.assertEqual(self.run_async(self.app.joined_groups(self.app.Account(account_id=1)))['groups'],result['groups']);self.assertEqual(len(calls),2);self.assertEqual(calls[0],{'limit':None});self.assertEqual(calls[1],{'limit':1001})
         self.assertNotIn('access_hash',json.dumps(result));self.assertEqual(c.sent,[])
     def test_pause_stops_scans_and_listing_and_floodwait_is_persisted(self):
         c=self.scan_client(scan_error=errors.FloodWaitError(request=None,capture=120))

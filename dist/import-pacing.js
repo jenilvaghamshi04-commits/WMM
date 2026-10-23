@@ -11,10 +11,13 @@ async function api(path,body){
   const request=sends?{...body,template_choices:choices}:body;
   try{const result=await rawApi(path,request);if(sends)recordTemplateChoices(choices);return result}
   catch(error){
+    if(sends&&await recoverTemplatePreview(error))throw Error('Saved options updated. Review the new preview, then send again.');
     if(!sends||error.code!=='send_cooldown')throw error;
     if(!serverFeatures.background_sends)throw Error('Deploy the latest WMM backend on Render for background sending. This message was not queued; reopen its preview after deployment.');
     if(path==='/sheet-send')throw error;
-    const result=await rawApi('/send-queue',{request_id:uniqueRequest(),action:path==='/conversation/reply'?'reply':path==='/follow-up'?'follow-up':'send',payload:request});
+    let result;
+    try{result=await rawApi('/send-queue',{request_id:uniqueRequest(),action:path==='/conversation/reply'?'reply':path==='/follow-up'?'follow-up':'send',payload:request})}
+    catch(queueError){if(await recoverTemplatePreview(queueError))throw Error('Saved options updated. Review the new preview, then send again.');throw queueError}
     recordTemplateChoices(choices);await refreshQueuedSends();return result;
   }
 }

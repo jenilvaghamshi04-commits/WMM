@@ -17,7 +17,7 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.13')
+app=FastAPI(title='WMM Team',version='3.14')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
 lock=asyncio.Lock();login_pending={};qr_logins={};clients={};startup_errors={};reply_task=None;geo_task=None;geo_lock=asyncio.Lock();folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock();manual_queue_task=None;manual_queue_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
@@ -43,6 +43,8 @@ db.execute('create table if not exists manual_send_queue(id text primary key,req
 db.execute('create table if not exists meta(key text primary key, value text)')
 db.execute('create table if not exists tg_group_admins(key text primary key,data text)')
 db.execute('create table if not exists tg_admin_batches(request_id text primary key,fingerprint text,result text)')
+db.execute('create table if not exists tg_group_watch(principal text primary key,data text)')
+db.execute('create table if not exists tg_group_watch_jobs(principal text,group_id text,slot integer,status text,detected_at text,next_attempt_at text,attempts integer,error text,primary key(principal,group_id))')
 db.execute('create table if not exists workspace_reset_requests(request_id text primary key,result text)')
 if 'telegram_message_id' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column telegram_message_id integer not null default 0")
 db.execute("create table if not exists folder_routes(principal text, target text, slot integer, desired text, applied text not null default '', revision integer not null default 1, applied_revision integer not null default 0, queued_at text, checked_at text not null default '', error text not null default '', next_attempt_at text not null default '', primary key(principal,target))")
@@ -326,6 +328,7 @@ async def identify(slot,c):
     old=db.execute('select blocked_until from account_info where principal=? order by blocked_until desc limit 1',(principal,)).fetchone()
     db.execute('insert or replace into account_info values(?,?,?,?,?)',(slot,principal,label,('••••'+phone[-4:]) if phone else '',old[0] if old else ''))
     db.execute('update outbox set principal=? where principal=?',(principal,f'slot:{slot}'));db.commit()
+    await initialize_group_watch(slot,c,principal)
     return principal
 
 def quota_floor(principal,kind,date):
@@ -844,7 +847,7 @@ async def auto_followup_loop():
 
 @app.on_event('startup')
 async def start():
-    global reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task,manual_queue_task
+    global reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task,manual_queue_task,group_watch_task
     recover_manual_queue();seed_folder_routes();seed_auto_followups();seed_country_checks()
     for slot in (1,2,3):
         try:
@@ -857,6 +860,7 @@ async def start():
     folder_task=asyncio.create_task(folder_routing_loop())
     auto_yes_task=asyncio.create_task(auto_yes_loop())
     auto_followup_task=asyncio.create_task(auto_followup_loop())
+    group_watch_task=asyncio.create_task(group_watch_loop())
 @app.on_event('shutdown')
 async def stop():
     qr_tasks=[state.get('task') for state in list(qr_logins.values()) if state.get('task')]
@@ -864,7 +868,7 @@ async def stop():
     for task in qr_tasks:
         try:await task
         except asyncio.CancelledError:pass
-    for task in (reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task,manual_queue_task):
+    for task in (reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task,manual_queue_task,group_watch_task):
         if task:
             task.cancel()
             try:await task
@@ -911,7 +915,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/api/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.13','time':int(datetime.now(timezone.utc).timestamp()*1000)},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.14','time':int(datetime.now(timezone.utc).timestamp()*1000)},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -944,6 +948,95 @@ async def add_account_slot():
         count+=1
         db.execute("insert or replace into meta values('account_slots',?)",(str(count),));db.commit()
     return {'account_id':count,'account_slots':count}
+
+group_watch_task=None;group_watch_baseline_lock=asyncio.Lock()
+def watch_state(principal):
+    row=db.execute('select data from tg_group_watch where principal=?',(principal,)).fetchone()
+    return json.loads(row[0]) if row else {}
+def save_watch(principal,state):
+    db.execute('insert or replace into tg_group_watch values(?,?)',(principal,json.dumps(state)))
+async def watch_memberships(client):
+    # Complete inventory, including archived chats. Never treat a truncated/failed list as a baseline.
+    groups=set()
+    async for dialog in client.iter_dialogs(limit=None):
+        entity=dialog.entity
+        if isinstance(entity,(types.Channel,types.Chat)) and not any(getattr(entity,k,False) for k in ('left','deactivated','migrated_to')):
+            groups.add(str(utils.get_peer_id(entity)))
+    return groups
+async def initialize_group_watch(slot,client,principal):
+    if not hasattr(client,'iter_dialogs'):return
+    async with group_watch_baseline_lock:
+        state=watch_state(principal)
+        if state.get('ready') or state.get('next_poll_at','')>stamp():return
+        try:
+            ensure_group_read_allowed(slot)
+            seen=await watch_memberships(client);now=stamp()
+            state={'ready':True,'initialized_at':now,'checked_at':now,'next_poll_at':(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),'next_scan_at':'','seen':sorted(seen),'error':''}
+        except (errors.FloodWaitError,errors.PeerFloodError) as exc:
+            pause_for_telegram(principal,exc);state={**state,'ready':False,'error':'Telegram paused group monitoring. Existing groups will be excluded when monitoring can start.','next_poll_at':(datetime.now(timezone.utc)+timedelta(minutes=15)).isoformat()}
+        except Exception:
+            state={**state,'ready':False,'error':'Waiting to record existing groups. Automatic collection starts after this succeeds.','next_poll_at':(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()}
+        with db:save_watch(principal,state)
+def group_watch_status(principal,authorized):
+    state=watch_state(principal)
+    counts=dict(db.execute('select status,count(*) from tg_group_watch_jobs where principal=? group by status',(principal,)).fetchall())
+    return {'ready':bool(state.get('ready')),'connected':authorized,'started_at':state.get('initialized_at',''),'checked_at':state.get('checked_at',''),'next_check_at':state.get('next_poll_at',''),'pending':counts.get('Pending',0),'saved':counts.get('Saved',0),'unavailable':counts.get('Unavailable',0),'error':state.get('error','')}
+async def poll_new_groups(slot):
+    client=await ready(slot)
+    async with lock:
+        principal=await identify(slot,client);state=watch_state(principal)
+        if not state.get('ready') or state.get('next_poll_at','')>stamp():return principal
+        ensure_group_read_allowed(slot)
+        try:
+            current=await watch_memberships(client);seen=set(state['seen']);now=stamp()
+            with db:
+                for gid in current-seen:
+                    db.execute("insert or ignore into tg_group_watch_jobs values(?,?,?,'Pending',?,?,0,'')",(principal,gid,slot,now,now))
+                state.update(seen=sorted(seen|current),checked_at=now,next_poll_at=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(),error='')
+                save_watch(principal,state)
+        except (errors.FloodWaitError,errors.PeerFloodError) as exc:
+            pause_for_telegram(principal,exc)
+            state.update(error='Telegram paused group monitoring.',next_poll_at=(datetime.now(timezone.utc)+timedelta(minutes=15)).isoformat())
+            with db:save_watch(principal,state)
+        except Exception:
+            # Keep the complete prior set so a failed page cannot import earlier groups.
+            state.update(error='Group check interrupted. Retrying later.',next_poll_at=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat())
+            with db:save_watch(principal,state)
+        return principal
+async def process_new_group_admins(slot,principal):
+    state=watch_state(principal)
+    if not state.get('ready') or state.get('next_scan_at','')>stamp():return
+    ensure_group_read_allowed(slot)
+    row=db.execute("select group_id,detected_at,attempts from tg_group_watch_jobs where principal=? and status='Pending' and next_attempt_at<=? order by detected_at,group_id limit 1",(principal,stamp())).fetchone()
+    if not row:return
+    gid,detected,attempts=row
+    # Reserve the read gap before network I/O. Each identity gets at most one admin read per 2 minutes.
+    state['next_scan_at']=(datetime.now(timezone.utc)+timedelta(minutes=2)).isoformat()
+    with db:save_watch(principal,state)
+    status='Saved';error='';next_at=''
+    try:
+        await scan_group(Scan(account_id=slot,link=gid,joined_only=True),automatic_principal=principal,detected_at=detected)
+    except HTTPException as exc:
+        error=str(exc.detail)
+        status='Unavailable' if exc.status_code in (400,403,409) else 'Pending'
+        if exc.status_code!=429:attempts+=1
+        if attempts>=3:status='Unavailable'
+        next_at=(datetime.now(timezone.utc)+timedelta(minutes=15)).isoformat()
+    except Exception:
+        error='Admin collection interrupted. Retrying later.';attempts+=1;status='Unavailable' if attempts>=3 else 'Pending'
+        next_at=(datetime.now(timezone.utc)+timedelta(minutes=15)).isoformat()
+    # An explicit reset can delete this job while a previous scan is finishing; never recreate it.
+    with db:db.execute('update tg_group_watch_jobs set slot=?,status=?,next_attempt_at=?,attempts=?,error=? where principal=? and group_id=?',(slot,status,next_at,attempts,error,principal,gid))
+async def group_watch_loop():
+    while True:
+        for slot in (1,2,3):
+            try:
+                if slot not in clients:continue
+                principal=await poll_new_groups(slot)
+                if principal:await process_new_group_admins(slot,principal)
+            except asyncio.CancelledError:raise
+            except Exception:pass  # Other accounts and the next scheduled check remain independent.
+        await asyncio.sleep(15)
 
 def group_admin_records():
     snapshots=[json.loads(row[0]) for row in db.execute('select data from tg_group_admins')]
@@ -1013,10 +1106,10 @@ async def status():
             if row:principal,label,phone,blocked=row
         u=usage(principal)
         sent=sent_in_current_quota(principal)
-        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
-    return {'version':'3.13','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'account_slots':account_slot_count(),'group_admins':group_admin_records(),'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True,'group_admin_directory':True,'progressive_accounts':True,'admin_bulk_sends':True}}
+        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'group_watch':group_watch_status(principal,authorized),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
+    return {'version':'3.14','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'account_slots':account_slot_count(),'group_admins':group_admin_records(),'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True,'group_admin_directory':True,'progressive_accounts':True,'admin_bulk_sends':True,'new_group_watch':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
-WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue','manual_send_queue','template_rotation','tg_group_admins','tg_admin_batches')
+WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue','manual_send_queue','template_rotation','tg_group_admins','tg_admin_batches','tg_group_watch_jobs')
 def workspace_reset_counts():
     count=lambda table:db.execute('select count(*) from '+table).fetchone()[0]
     return {'contacts':count('contacts'),'messages':count('outbox'),'replies':count('replies'),'leads':len(lead_records()),'automations':count('auto_yes_jobs')+count('auto_yes_enrollments')+count('auto_followup_jobs')+count('manual_send_queue')}
@@ -1229,11 +1322,16 @@ async def logout(body:Account):
     return {'ok':True}
 @app.post('/scan',dependencies=[Depends(auth)])
 async def scan(body:Scan):
+    return await scan_group(body)
+async def scan_group(body:Scan,automatic_principal=None,detected_at=''):
     client=await ready(body.account_id)
     link=body.link.strip().replace('https://t.me/','').replace('http://t.me/','').strip('/')
     if not link or '/' in link and not link.startswith('joinchat/'):raise HTTPException(400,'Use a group username or invite link, not a post link')
     async with lock:
         ensure_group_read_allowed(body.account_id);principal=await identify(body.account_id,client);ensure_group_read_allowed(body.account_id)
+        if automatic_principal is not None:
+            if principal!=automatic_principal:raise HTTPException(409,'Account identity changed. This group belongs to the original account.')
+            if not db.execute("select 1 from tg_group_watch_jobs where principal=? and group_id=? and status='Pending'",(principal,body.link)).fetchone():raise HTTPException(409,'Automatic collection was cancelled.')
         try:
             if link.startswith('+') or link.startswith('joinchat/'):
                 invite=link.split('/')[-1].lstrip('+')
@@ -1267,6 +1365,10 @@ async def scan(body:Scan):
                 c={'id':str(entity.id)+':'+str(u.id),'user_id':str(u.id),'name':(' '.join(filter(None,[u.first_name,u.last_name])) or 'Unnamed admin'),'username':u.username or '', 'group':entity.title,'link':body.link,'role':'Owner' if owner else (rank or 'Admin'),'title':rank,'admin_role':'Owner' if owner else 'Admin','group_username':getattr(entity,'username','') or '','source':'Telegram admin title' if rank else 'Telegram permissions','scanned_at':scraped_at,'status':'Ready','is_bot':False,'scan_account':body.account_id,'group_id':str(utils.get_peer_id(entity))}
                 save(c);observe_public_phone(c,u);c['location']=location_for(c);result.append(c)
             snapshot={'key':str(utils.get_peer_id(entity))+':'+principal,'group_id':str(utils.get_peer_id(entity)),'name':entity.title,'username':getattr(entity,'username','') or '','kind':'channel' if getattr(entity,'broadcast',False) else 'group','account_id':body.account_id,'scraped_at':scraped_at,'admins':[{'name':c['name'],'username':c['username'],'user_id':c['user_id'],'role':c['admin_role'],'title':c['title'],'scraped_at':scraped_at} for c in result]}
+            previous=db.execute('select data from tg_group_admins where key=?',(snapshot['key'],)).fetchone()
+            prior=json.loads(previous[0]) if previous else {}
+            snapshot['collection_source']='automatic_join' if automatic_principal is not None else prior.get('collection_source','manual')
+            snapshot['detected_at']=detected_at or prior.get('detected_at','')
             db.execute('insert or replace into tg_group_admins values(?,?)',(snapshot['key'],json.dumps(snapshot)));db.commit()
             group={'id':'group:'+str(utils.get_peer_id(entity)),'name':entity.title,'username':getattr(entity,'username','') or '', 'role':'Group chat','group':entity.title,'link':body.link,'group_id':str(utils.get_peer_id(entity)),'kind':'group','scan_account':body.account_id,'source':'Telegram group','scanned_at':stamp(),'status':'Ready'}
             stored=db.execute('select data from contacts where id=?',(group['id'],)).fetchone()
@@ -1319,6 +1421,10 @@ async def config(body:Config):
             merged['template']=next((v for v in merged['template_variants']['template'] if v.strip()),'')
         db.execute('insert or replace into settings values(1,?)',(json.dumps(merged),));db.commit()
     return {'ok':True}
+@app.get('/templates',dependencies=[Depends(auth)])
+async def template_catalog():
+    cfg=settings()
+    return {key:cfg[key] for key in TEMPLATE_KEYS}|{'template_variants':cfg['template_variants'],'template_rotation':rotation_status(cfg)}
 @app.post('/templates',dependencies=[Depends(auth)])
 async def save_templates(body:Templates):
     values={k:(v.strip() if isinstance(v,str) else v) for k,v in body.model_dump(exclude_none=True).items() if k!='no_reply_template'}
