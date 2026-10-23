@@ -17,7 +17,7 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.11')
+app=FastAPI(title='WMM Team',version='3.12')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
 lock=asyncio.Lock();login_pending={};qr_logins={};clients={};startup_errors={};reply_task=None;geo_task=None;geo_lock=asyncio.Lock();folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock();manual_queue_task=None;manual_queue_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
@@ -41,6 +41,7 @@ db.execute('create table if not exists import_batches(id text primary key,data t
 db.execute('create table if not exists template_rotation(key text primary key,data text)')
 db.execute('create table if not exists manual_send_queue(id text primary key,request_id text unique,principal text,slot integer,contact_id text,kind text,target text,payload text,status text,created_at text,next_attempt_at text,error text)')
 db.execute('create table if not exists meta(key text primary key, value text)')
+db.execute('create table if not exists tg_group_admins(key text primary key,data text)')
 db.execute('create table if not exists workspace_reset_requests(request_id text primary key,result text)')
 if 'telegram_message_id' not in {r[1] for r in db.execute('pragma table_info(message_details)')}:db.execute("alter table message_details add column telegram_message_id integer not null default 0")
 db.execute("create table if not exists folder_routes(principal text, target text, slot integer, desired text, applied text not null default '', revision integer not null default 1, applied_revision integer not null default 0, queued_at text, checked_at text not null default '', error text not null default '', next_attempt_at text not null default '', primary key(principal,target))")
@@ -879,7 +880,8 @@ async def rpc_error(request,exc):
 class Account(BaseModel):account_id:int=Field(default=1,ge=1,le=3)
 class Login(Account):phone:str
 class Verify(Account):phone:str='';code:str='';password:str=''
-class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False
+class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False;joined_only:bool=False
+class GroupAdminRead(Account):group_id:str=Field(min_length=1,max_length=40)
 class Config(BaseModel):template:str|None=None;sheet_url:str='';sender_account:int=Field(default=1,ge=1,le=3);token_symbol:str=Field(default='',max_length=33)
 class Templates(BaseModel):
     template:str=Field(min_length=1,max_length=4096)
@@ -908,7 +910,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/api/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.11','time':int(datetime.now(timezone.utc).timestamp()*1000)},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.12','time':int(datetime.now(timezone.utc).timestamp()*1000)},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -926,6 +928,74 @@ async def configure_telegram_api(body:TelegramAPI):
         db.execute('insert or replace into telegram_api values(?,?,?)',(slot,body.api_id,value));db.commit()
         clients[slot]=attach_reply_listener(candidate,slot);login_pending.pop(slot,None);startup_errors.pop(slot,None)
     return {'api_configured':True,'account_id':slot}
+def account_slot_count():
+    row=db.execute("select value from meta where key='account_slots'").fetchone()
+    try:requested=int(row[0]) if row else 1
+    except (TypeError,ValueError):requested=1
+    used=[r[0] for r in db.execute('select id from telegram_api union select slot from account_info')]
+    return min(3,max([1,requested,*used,*clients.keys()]))
+
+@app.post('/accounts/add',dependencies=[Depends(auth)])
+async def add_account_slot():
+    async with lock:
+        count=account_slot_count()
+        if count>=3:raise HTTPException(409,'All three account slots are already available.')
+        count+=1
+        db.execute("insert or replace into meta values('account_slots',?)",(str(count),));db.commit()
+    return {'account_id':count,'account_slots':count}
+
+def group_admin_records():
+    snapshots=[json.loads(row[0]) for row in db.execute('select data from tg_group_admins')]
+    known={(g['group_id'],g['account_id']) for g in snapshots}
+    # Existing scans remain visible after upgrading, without contacting Telegram again.
+    old={};all_contacts=contacts();groups={c.get('group_id'):c for c in all_contacts if c.get('kind')=='group'}
+    for c in all_contacts:
+        if c.get('kind')=='group' or not c.get('scan_account') or not c.get('group_id'):continue
+        pair=(c['group_id'],c['scan_account'])
+        if pair in known:continue
+        if pair not in old:
+            group=groups.get(c['group_id'],{})
+            old[pair]={'key':'legacy:'+str(pair[0])+':'+str(pair[1]),'group_id':c['group_id'],'name':c.get('group','Unnamed group'),'username':group.get('username',''),'kind':'group','account_id':c['scan_account'],'scraped_at':c.get('scanned_at',''),'admins':[],'legacy':True}
+        old[pair]['admins'].append({'name':c.get('name','Unnamed admin'),'username':c.get('username',''),'user_id':str(c.get('user_id','')),'role':'Owner' if c.get('role')=='Owner' else 'Admin','title':c.get('title',''),'scraped_at':c.get('scanned_at','')})
+        old[pair]['scraped_at']=max(old[pair]['scraped_at'],c.get('scanned_at',''))
+    return sorted(snapshots+list(old.values()),key=lambda g:g.get('scraped_at',''),reverse=True)
+
+def ensure_group_read_allowed(slot):
+    row=db.execute('select blocked_until from account_info where slot=?',(slot,)).fetchone()
+    if row and row[0] and row[0]>stamp():raise HTTPException(429,'This account is paused by Telegram until '+row[0])
+
+joined_group_cache={}
+@app.post('/groups/joined',dependencies=[Depends(auth)])
+async def joined_groups(body:Account):
+    client=await ready(body.account_id)
+    async with lock:
+        ensure_group_read_allowed(body.account_id);principal=await identify(body.account_id,client);ensure_group_read_allowed(body.account_id)
+        cached=joined_group_cache.get(principal)
+        if cached and datetime.fromisoformat(cached['checked_at'])>datetime.now(timezone.utc)-timedelta(minutes=10):return {**cached,'account_id':body.account_id,'cached':True}
+        try:
+            result={};seen=0;truncated=False
+            async for dialog in client.iter_dialogs(limit=1001):
+                seen+=1
+                if seen>1000:truncated=True;break
+                entity=dialog.entity
+                if not isinstance(entity,(types.Channel,types.Chat)) or getattr(entity,'left',False) or getattr(entity,'deactivated',False) or getattr(entity,'migrated_to',None):continue
+                gid=str(utils.get_peer_id(entity));result[gid]={'group_id':gid,'name':entity.title,'username':getattr(entity,'username','') or '','kind':'channel' if getattr(entity,'broadcast',False) else 'group'}
+            data={'groups':sorted(result.values(),key=lambda g:g['name'].casefold()),'checked_at':stamp(),'truncated':truncated}
+            joined_group_cache[principal]=data
+            return {**data,'account_id':body.account_id,'cached':False}
+        except (errors.FloodWaitError,errors.PeerFloodError) as exc:
+            pause_for_telegram(principal,exc);raise HTTPException(429,'Telegram paused group reading. Check Account health and wait before trying again.')
+        except errors.RPCError as exc:raise HTTPException(400,str(exc))
+
+@app.get('/groups/admins',dependencies=[Depends(auth)])
+async def saved_group_admins():return {'groups':group_admin_records()}
+
+@app.post('/groups/admins',dependencies=[Depends(auth)])
+async def read_group_admins(body:GroupAdminRead):
+    if not re.fullmatch(r'-?[0-9]+',body.group_id):raise HTTPException(400,'Choose a joined group from the list.')
+    # This path never joins, leaves or messages a group.
+    return await scan(Scan(account_id=body.account_id,link=body.group_id,joined_only=True))
+
 @app.get('/status',dependencies=[Depends(auth)])
 async def status():
     accounts=[]
@@ -943,9 +1013,9 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
-    return {'version':'3.11','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True}}
+    return {'version':'3.12','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'account_slots':account_slot_count(),'group_admins':group_admin_records(),'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True,'group_admin_directory':True,'progressive_accounts':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
-WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue','manual_send_queue','template_rotation')
+WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue','manual_send_queue','template_rotation','tg_group_admins')
 def workspace_reset_counts():
     count=lambda table:db.execute('select count(*) from '+table).fetchone()[0]
     return {'contacts':count('contacts'),'messages':count('outbox'),'replies':count('replies'),'leads':len(lead_records()),'automations':count('auto_yes_jobs')+count('auto_yes_enrollments')+count('auto_followup_jobs')+count('manual_send_queue')}
@@ -1162,6 +1232,7 @@ async def scan(body:Scan):
     link=body.link.strip().replace('https://t.me/','').replace('http://t.me/','').strip('/')
     if not link or '/' in link and not link.startswith('joinchat/'):raise HTTPException(400,'Use a group username or invite link, not a post link')
     async with lock:
+        ensure_group_read_allowed(body.account_id);principal=await identify(body.account_id,client);ensure_group_read_allowed(body.account_id)
         try:
             if link.startswith('+') or link.startswith('joinchat/'):
                 invite=link.split('/')[-1].lstrip('+')
@@ -1174,25 +1245,32 @@ async def scan(body:Scan):
                     if not isinstance(r,types.ChatInviteAlready):raise HTTPException(409,'Enable Join before scan to join this private group')
                     entity=r.chat
             else:
-                entity=await client.get_entity(link.lstrip('@'))
+                entity=await client.get_entity(int(link) if body.joined_only else link.lstrip('@'))
                 if body.join and isinstance(entity,types.Channel):await client(functions.channels.JoinChannelRequest(entity))
+            if not isinstance(entity,(types.Chat,types.Channel)):raise HTTPException(400,'Choose a Telegram group or channel.')
+            if body.joined_only:
+                if getattr(entity,'left',False) or getattr(entity,'deactivated',False):raise HTTPException(409,'This account is no longer a member. Join in Telegram before loading admins.')
+                if isinstance(entity,types.Channel):await client(functions.channels.GetParticipantRequest(entity,types.InputPeerSelf()))
             if isinstance(entity,types.Chat):
                 full=await client(functions.messages.GetFullChatRequest(entity.id)); users={u.id:u for u in full.users}
+                if not hasattr(full.full_chat.participants,'participants'):raise HTTPException(403,'Telegram hides this group admin list from your account.')
                 people=[(users[p.user_id],p) for p in full.full_chat.participants.participants if isinstance(p,(types.ChatParticipantAdmin,types.ChatParticipantCreator))]
             else:
                 users=await client.get_participants(entity,filter=types.ChannelParticipantsAdmins)
                 people=[(u,u.participant) for u in users]
-            result=[]
+            result=[];scraped_at=stamp()
             for u,p in people:
                 if getattr(u,'bot',False) or getattr(u,'deleted',False):continue
                 rank=getattr(p,'rank',None) or ''
                 owner=isinstance(p,(types.ChannelParticipantCreator,types.ChatParticipantCreator))
-                c={'id':str(entity.id)+':'+str(u.id),'user_id':str(u.id),'name':(' '.join(filter(None,[u.first_name,u.last_name])) or 'Unnamed admin'),'username':u.username or '', 'group':entity.title,'link':body.link,'role':'Owner' if owner else (rank or 'Admin'),'title':rank,'source':'Telegram admin title' if rank else 'Telegram permissions','scanned_at':stamp(),'status':'Ready','is_bot':False,'scan_account':body.account_id,'group_id':str(utils.get_peer_id(entity))}
+                c={'id':str(entity.id)+':'+str(u.id),'user_id':str(u.id),'name':(' '.join(filter(None,[u.first_name,u.last_name])) or 'Unnamed admin'),'username':u.username or '', 'group':entity.title,'link':body.link,'role':'Owner' if owner else (rank or 'Admin'),'title':rank,'admin_role':'Owner' if owner else 'Admin','group_username':getattr(entity,'username','') or '','source':'Telegram admin title' if rank else 'Telegram permissions','scanned_at':scraped_at,'status':'Ready','is_bot':False,'scan_account':body.account_id,'group_id':str(utils.get_peer_id(entity))}
                 save(c);observe_public_phone(c,u);c['location']=location_for(c);result.append(c)
+            snapshot={'key':str(utils.get_peer_id(entity))+':'+principal,'group_id':str(utils.get_peer_id(entity)),'name':entity.title,'username':getattr(entity,'username','') or '','kind':'channel' if getattr(entity,'broadcast',False) else 'group','account_id':body.account_id,'scraped_at':scraped_at,'admins':[{'name':c['name'],'username':c['username'],'user_id':c['user_id'],'role':c['admin_role'],'title':c['title'],'scraped_at':scraped_at} for c in result]}
+            db.execute('insert or replace into tg_group_admins values(?,?)',(snapshot['key'],json.dumps(snapshot)));db.commit()
             group={'id':'group:'+str(utils.get_peer_id(entity)),'name':entity.title,'username':getattr(entity,'username','') or '', 'role':'Group chat','group':entity.title,'link':body.link,'group_id':str(utils.get_peer_id(entity)),'kind':'group','scan_account':body.account_id,'source':'Telegram group','scanned_at':stamp(),'status':'Ready'}
             stored=db.execute('select data from contacts where id=?',(group['id'],)).fetchone()
             group['membership']=json.loads(stored[0]).get('membership',{}) if stored else {}
-            if body.join:group['membership'][str(body.account_id)]='member'
+            if body.join or body.joined_only:group['membership'][str(body.account_id)]='member'
             is_group=getattr(entity,'megagroup',False) or isinstance(entity,types.Chat)
             if is_group:save(group)
             leave={'requested':body.leave_after_scan,'status':'not_requested','error':''}
@@ -1221,7 +1299,10 @@ async def scan(body:Scan):
                         group['membership'][str(body.account_id)]='unknown'
                     group['last_leave']={**leave,'account_id':body.account_id,'at':stamp()}
                     if is_group:save(group)
-            return {'contacts':result,'group':entity.title,'count':len(result),'leave':leave,'account_id':body.account_id}
+            return {'contacts':result,'group':entity.title,'count':len(result),'group_record':snapshot,'leave':leave,'account_id':body.account_id}
+        except (errors.FloodWaitError,errors.PeerFloodError) as exc:
+            pause_for_telegram(principal,exc);raise HTTPException(429,'Telegram paused admin reading. Check Account health and wait before trying again.')
+        except errors.UserNotParticipantError:raise HTTPException(409,'This account is not a member. Join in Telegram before loading admins.')
         except errors.InviteRequestSentError:raise HTTPException(409,'Join request sent. Scan after an administrator approves it.')
         except errors.ChatAdminRequiredError:raise HTTPException(403,'Telegram hides this admin list from your account. Try its linked discussion group or ask for access.')
         except HTTPException:raise

@@ -1,7 +1,7 @@
 /* Same-tab dashboard sessions. Telegram credentials and workspace records stay on the server. */
 (function(root){
   const name='wmm.dashboard.session.v1';
-  const pages=new Set(['directory','saved','sent','replies','pipeline','templates','health','activity','connections']);
+  const pages=new Set(['directory','groups','saved','sent','replies','pipeline','templates','health','activity','connections']);
   const filterIds=['savedType','role','sentScope','sentStatus','replyMessageOrder','replyAccount','leadFilter','leadType'];
   function create(storage){
     function clear(){try{storage.removeItem(name)}catch{}}
