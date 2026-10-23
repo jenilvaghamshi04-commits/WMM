@@ -22,7 +22,7 @@ class AutomaticFollowupTests(unittest.TestCase):
         self.app.record_reply('101','999',1,msg)
     def test_waits_72_hours_then_sends_once(self):
         self.original(timedelta(days=2,hours=23));self.process();self.assertEqual(len(self.c.sent),1);self.assertEqual(self.state(),'Scheduled')
-        self.app.db.execute('update auto_followup_jobs set due_at=?',((datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat(),));self.app.db.commit();self.process();self.process()
+        self.app.db.execute('update outbox set at=? where id=?',((datetime.now(timezone.utc)-timedelta(days=3,seconds=1)).isoformat(),self.root));self.app.db.commit();self.process();self.process()
         self.assertEqual(len(self.c.sent),2);self.assertEqual(self.c.sent[-1][1],self.app.DEFAULT_FOLLOWUP);self.assertEqual(self.state(),'Complete');self.assertEqual(self.app.usage('101')['dm']['used'],1)
     def test_existing_unreplied_messages_are_scheduled(self):
         self.original();self.process();self.assertEqual(len(self.c.sent),2)

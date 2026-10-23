@@ -1,6 +1,6 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const nodes=new Map();function node(id){if(!nodes.has(id))nodes.set(id,{value:'',textContent:'',innerHTML:'',querySelectorAll:()=>[],querySelector:()=>null});return nodes.get(id)}
-const fields=[['initial','template','introduction'],['followup','followup_template','followup'],['yesPitch','yes_pitch_template','yesPitch'],['yesDemo','yes_demo_template','yesDemo'],['noReply','no_reply_template','noReply']];
+const fields=[['initial','template','introduction'],['followup','followup_template','followup'],['yesPitch','yes_pitch_template','yesPitch'],['yesDemo','yes_demo_template','yesDemo']];
 const ctx=vm.createContext({document:{addEventListener(){},getElementById:node,querySelector:()=>({textContent:''})},templateFields:fields,WMMMessageModel:{introduction:'Legacy introduction',followup:'Legacy followup',yesPitch:'Legacy pitch',yesDemo:'Legacy invitation',noReply:'Legacy no'},savedTemplate:'Initial',savedFollowupTemplate:'Follow',savedYesPitch:'Pitch',savedYesDemo:'Invite',savedNoReply:'No',Math});
 vm.runInContext(fs.readFileSync('dist/template-variants.js','utf8'),ctx);const m=ctx.WMMTemplateVariants;
 assert.equal(m.pick(['one','','three','','five'],()=>0).text,'one');assert.equal(m.pick(['one','','three','','five'],()=>0.5).text,'three');assert.equal(m.pick(['one','','three','','five'],()=>0.999).index,4);assert.throws(()=>m.pick([' ','','','','']),/at least one/);assert.equal(m.normalize(undefined,'Legacy')[0],'Legacy');assert.equal(m.normalize(['one']).length,5);

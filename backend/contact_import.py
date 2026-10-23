@@ -53,6 +53,8 @@ ALIASES={
  'role':{'role','title','roletitle','position'},
  'group':{'group','community','project','company'},
  'kind':{'type','kind','contacttype'},
+ 'country':{'country','countrycode','phonecountry'},
+ 'timezone':{'timezone','ianatimezone','tz'},
 }
 def header_key(value):return re.sub('[^a-z0-9]','',value.casefold())
 def default_mapping(rows):

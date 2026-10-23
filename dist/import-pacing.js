@@ -47,17 +47,17 @@ async function readImportSheet(){
   const d=await api('/contacts/import/read',body);importSheetData=d;
   document.getElementById('importHeader').checked=d.has_header;
   const headers=d.rows[0];
-  for(const field of ['telegram','name','role','group','kind'])document.getElementById('importColumn_'+field).innerHTML=importColumnOptions(headers,d.mapping[field]);
+  for(const field of ['telegram','name','role','group','kind','country','timezone'])document.getElementById('importColumn_'+field).innerHTML=importColumnOptions(headers,d.mapping[field]);
   document.getElementById('importMapping').hidden=false;document.getElementById('importMapping').open=true;
   document.getElementById('importSummary').textContent=d.rows.length+' rows read. Check the columns, then preview.';
 }
 async function previewImportSheet(){
   if(!importSheetData)throw Error('Read a sheet first.');
   clearImportPreview();const mapping={};
-  for(const field of ['telegram','name','role','group','kind']){const value=document.getElementById('importColumn_'+field).value;mapping[field]=value===''?null:Number(value)}
+  for(const field of ['telegram','name','role','group','kind','country','timezone']){const value=document.getElementById('importColumn_'+field).value;mapping[field]=value===''?null:Number(value)}
   const d=await api('/contacts/import/preview',{rows:importSheetData.rows,mapping,has_header:document.getElementById('importHeader').checked,default_kind:document.getElementById('importDefaultKind').value,source_name:importSheetData.source_name});
   importBatchId=d.batch_id;document.getElementById('importMapping').open=false;
-  document.getElementById('importPreviewBody').innerHTML=d.items.map(row=>'<tr><td>'+row.row+'</td><td>'+esc(row.name||'—')+'<div class="tiny">'+esc(row.telegram)+'</div></td><td>'+esc(row.kind||'—')+'</td><td><b>'+esc(row.status)+'</b><div class="tiny">'+esc(row.reason)+'</div></td></tr>').join('');
+  document.getElementById('importPreviewBody').innerHTML=d.items.map(row=>'<tr><td>'+row.row+'</td><td>'+esc(row.name||'—')+'<div class="tiny">'+esc(row.telegram)+'</div></td><td>'+esc(row.kind||'—')+'<div class="tiny">'+esc(row.country||'Country unknown')+(row.timezone?' · '+esc(row.timezone):'')+'</div></td><td><b>'+esc(row.status)+'</b><div class="tiny">'+esc(row.reason)+'</div></td></tr>').join('');
   document.getElementById('importSummary').textContent=d.ready+' ready to add · '+d.duplicates+' duplicates · '+d.skipped+' skipped. Nothing has been sent.';
   document.getElementById('confirmImport').disabled=!d.ready;
 }

@@ -4,7 +4,6 @@
   const exchanges={"bingx": "BingX", "bitget": "Bitget", "bitunix": "Bitunix", "blofin": "BloFin", "gateio": "Gate.io", "htx": "HTX", "lbank": "LBank", "lovelylegends": "Lovely Legends", "mexc": "MEXC", "okx": "OKX", "poloniex": "Poloniex", "toobit": "Toobit", "weex": "WEEX", "xt": "XT.com"};
   const yesPitch="Nice to meet you @username,\nThis is mark from WMM\n\nI saw the @TOKEN chart on {{exchange}}, candlesticks look broken, we provide a professional trading team for market making, {{exchange}} trading fees are quite high but we make it good in the same daily fee spending budget\n\nWe make the chart most compatible with trading views and other trading signals tools to activate more real traders.";
   const yesDemo="We can give you a free demo also\nIf you have time we can jump on call and discuss further";
-  const noReply="We can also offer a free demo so you can see how we work before making a decision. Would you be open to a quick call to discuss what could work for your project?";
   function type(contact){return contact.kind||'dm'}
   function timestamp(value){const n=Date.parse(value);return Number.isFinite(n)?n:0}
   function latestFirst(rows,getTime=row=>row.at){return rows.slice().sort((a,b)=>timestamp(getTime(b))-timestamp(getTime(a)))}
@@ -48,5 +47,5 @@
     }
     return {message:state(false),followup:state(true)};
   }
-  root.WMMMessageModel={exchanges,yesPitch,yesDemo,noReply,type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken,latestFirst,latestContacts,latestAccounts,hasReplied,followupEligible};
+  root.WMMMessageModel={exchanges,yesPitch,yesDemo,type,conversation,conversations,personalize,status,deliveryStates,introduction,followup,normalizeToken,requiresToken,latestFirst,latestContacts,latestAccounts,hasReplied,followupEligible};
 })(typeof window==='undefined'?globalThis:window);

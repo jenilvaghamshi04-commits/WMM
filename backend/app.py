@@ -8,15 +8,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel,SecretStr,Field
 from telethon import TelegramClient,functions,types,errors,utils,events
 from telethon.extensions import BinaryReader
+try:from backend import contact_geo as geo
+except ImportError:import contact_geo as geo
 
 ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True);os.chmod(ROOT,0o700)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.8')
+app=FastAPI(title='WMM Team',version='3.9')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
-lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
+lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;geo_task=None;geo_lock=asyncio.Lock();folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
+db.execute('create table if not exists location_profiles(key text primary key,data text)')
+db.execute('create table if not exists country_lookup_queue(key text primary key,contact_id text,slot integer,principal text,next_attempt_at text,last_checked_at text,error text)')
 db.execute('create table if not exists contacts(id text primary key, data text)')
 db.execute('create table if not exists settings(id integer primary key, data text)')
 db.execute('create table if not exists telegram_api(id integer primary key, api_id integer, api_hash text)')
@@ -46,6 +50,8 @@ db.execute("create table if not exists auto_yes_jobs(id text primary key,princip
 for table,column,declaration in [('auto_yes_enrollments','no_reply',"TEXT NOT NULL DEFAULT ''"),('auto_yes_jobs','branch',"TEXT NOT NULL DEFAULT 'yes'")]:
     if column not in [r[1] for r in db.execute('pragma table_info('+table+')')]:db.execute('alter table '+table+' add column '+column+' '+declaration)
 db.execute("update auto_yes_jobs set status='Pending' where status='Sending'")
+# Retire queued legacy negative-response jobs on upgrade. Delivery history remains intact.
+db.execute("update auto_yes_jobs set status='Cancelled',error='Negative-response automation was removed' where branch!='yes' and status not in ('Complete','Cancelled')")
 # Completed conversations cannot be re-armed after upgrading or restarting.
 db.execute("update auto_yes_enrollments set enabled=0 where exists(select 1 from auto_yes_jobs j where j.principal=auto_yes_enrollments.principal and j.target=auto_yes_enrollments.target and j.status='Complete')")
 db.execute("create table if not exists auto_followup_jobs(root_id text primary key,principal text,target text unique,slot integer,contact_id text,due_at text,token_symbol text,exchange text,body text not null default '',status text not null default 'Scheduled',error text not null default '',next_attempt_at text not null default '')")
@@ -108,11 +114,11 @@ DEFAULT_FOLLOWUP="Hey, just following up on my previous message. Is improving li
 EXCHANGES={'bingx':'BingX','bitget':'Bitget','bitunix':'Bitunix','blofin':'BloFin','gateio':'Gate.io','htx':'HTX','lbank':'LBank','lovelylegends':'Lovely Legends','mexc':'MEXC','okx':'OKX','poloniex':'Poloniex','toobit':'Toobit','weex':'WEEX','xt':'XT.com'}
 DEFAULT_YES_PITCH="Nice to meet you @username,\nThis is mark from WMM\n\nI saw the @TOKEN chart on {{exchange}}, candlesticks look broken, we provide a professional trading team for market making, {{exchange}} trading fees are quite high but we make it good in the same daily fee spending budget\n\nWe make the chart most compatible with trading views and other trading signals tools to activate more real traders."
 DEFAULT_YES_DEMO="We can give you a free demo also\nIf you have time we can jump on call and discuss further"
-DEFAULT_NO_REPLY="We can also offer a free demo so you can see how we work before making a decision. Would you be open to a quick call to discuss what could work for your project?"
-TEMPLATE_KEYS=('template','followup_template','yes_pitch_template','yes_demo_template','no_reply_template')
+TEMPLATE_KEYS=('template','followup_template','yes_pitch_template','yes_demo_template')
 def settings():
     r=db.execute('select data from settings where id=1').fetchone()
-    cfg={'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'','yes_pitch_template':DEFAULT_YES_PITCH,'yes_demo_template':DEFAULT_YES_DEMO,'no_reply_template':DEFAULT_NO_REPLY,'auto_yes_enabled':True,'auto_followup_enabled':True,'send_delay_seconds':120,**(json.loads(r[0]) if r else {})}
+    cfg={'template':'','followup_template':DEFAULT_FOLLOWUP,'sheet_url':'','sender_account':1,'token_symbol':'','yes_pitch_template':DEFAULT_YES_PITCH,'yes_demo_template':DEFAULT_YES_DEMO,'auto_yes_enabled':True,'auto_followup_enabled':True,'send_delay_seconds':120,**(json.loads(r[0]) if r else {})}
+    cfg.pop('no_reply_template',None)
     existing=cfg.get('template_variants') or {}
     cfg['template_variants']={key:(list(existing[key])+['']*5)[:5] if key in existing else [cfg[key],'','','',''] for key in TEMPLATE_KEYS}
     return cfg
@@ -150,10 +156,121 @@ async def update_sending_pace(body:SendingPace):
         db.execute('insert or replace into settings values(1,?)',(json.dumps(cfg),));db.commit()
     return {'ok':True,'delay_seconds':body.delay_seconds}
 
+def geo_key(contact):
+    kind=contact.get('kind','dm');return kind+':'+str(contact.get('group_id') if kind=='group' else contact.get('user_id') or contact['id'])
+def geo_data(key):
+    row=db.execute('select data from location_profiles where key=?',(key,)).fetchone()
+    return json.loads(row[0]) if row else {}
+def location_for(contact_or_key):
+    key=geo_key(contact_or_key) if isinstance(contact_or_key,dict) else contact_or_key
+    return geo.profile(geo_data(key)) if key.startswith('dm:') else {'country_code':'','country_name':'Not applicable','country_source':'Group chat','timezone':'','needs_timezone':False}
+def store_location(key,data,commit=True):
+    db.execute('insert or replace into location_profiles values(?,?)',(key,json.dumps(data)))
+    if commit:db.commit()
+def observe_country(contact,code,source):
+    if contact.get('kind','dm')!='dm':return
+    try:code=geo.country_code(code)
+    except ValueError:return
+    if not code:return
+    key=geo_key(contact);data=geo_data(key);data.update(detected_country=code,detected_source=source,observed_at=stamp());store_location(key,data)
+def observe_public_phone(contact,user):
+    code=geo.phone_country(getattr(user,'phone',None))
+    if code:observe_country(contact,code,'Telegram-visible phone country')
+def migrate_location(old_key,new_key):
+    if old_key==new_key:return
+    old=geo_data(old_key);current=geo_data(new_key)
+    if old:
+        # Explicit overrides survive resolution; an existing resolved profile keeps its own overrides.
+        merged={**old,**current}
+        store_location(new_key,merged,False);db.execute('delete from location_profiles where key=?',(old_key,))
+    db.execute('delete from country_lookup_queue where key=?',(old_key,));db.commit()
+def queue_country_check(contact,force=False):
+    if contact.get('kind','dm')!='dm' or contact.get('is_bot') or contact.get('import_unresolved') or not str(contact.get('user_id','')).isdigit():return
+    key=geo_key(contact);slot=contact.get('scan_account',1)
+    first=db.execute("select principal,slot from outbox where target=? and kind='dm' and status='Sent' order by at limit 1",(str(contact['user_id']),)).fetchone()
+    if first:principal,slot=first
+    else:
+        info=db.execute('select principal from account_info where slot=?',(slot,)).fetchone();principal=info[0] if info else ''
+    db.execute('insert or ignore into country_lookup_queue values(?,?,?,?,?,?,?)',(key,contact['id'],slot,principal,'','',''))
+    if first:db.execute('update country_lookup_queue set principal=?,slot=? where key=?',(principal,slot,key))
+    elif principal:db.execute("update country_lookup_queue set principal=?,slot=? where key=? and principal=''",(principal,slot,key))
+    if force:
+        floor=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+        db.execute("update country_lookup_queue set next_attempt_at='' where key=? and last_checked_at<?",(key,floor))
+    db.commit()
+def seed_country_checks():
+    for contact in contacts():queue_country_check(contact)
+async def process_country_checks():
+    async with geo_lock:
+        async with lock:
+            pause=db.execute("select value from meta where key='country_lookup_after'").fetchone()
+            if pause and pause[0]>stamp():return {'checked':0,'results':[]}
+            row=db.execute("select q.key,q.contact_id,q.slot,q.principal from country_lookup_queue q join contacts c on c.id=q.contact_id where q.next_attempt_at<=? order by q.last_checked_at,q.rowid limit 1",(stamp(),)).fetchone()
+            if not row:return {'checked':0,'results':[]}
+            key,cid,slot,principal=row;data=geo_data(key)
+            db.execute("insert or replace into meta values('country_lookup_after',?)",((datetime.now(timezone.utc)+timedelta(seconds=30)).isoformat(),));db.commit()
+            error='';retry=(datetime.now(timezone.utc)+timedelta(days=7)).isoformat()
+            try:
+                contact=json.loads(db.execute('select data from contacts where id=?',(cid,)).fetchone()[0])
+                if principal:client,slot=await folder_client(principal,slot)
+                else:client=await ready(slot);principal=await identify(slot,client)
+                blocked=db.execute('select blocked_until from account_info where principal=?',(principal,)).fetchone()
+                if blocked and blocked[0] and blocked[0]>stamp():
+                    retry=blocked[0];raise HTTPException(429,'Country lookup paused until Telegram permits this account.')
+                peer=await asyncio.wait_for(client.get_input_entity(int(contact['user_id'])),timeout=12)
+                result=await asyncio.wait_for(client(functions.messages.GetPeerSettingsRequest(peer)),timeout=12)
+                code=getattr(getattr(result,'settings',None),'phone_country',None)
+                try:code=geo.country_code(code)
+                except ValueError:code=''
+                if code:data.update(detected_country=code,detected_source='Telegram phone country',observed_at=stamp())
+                else:
+                    user=next((u for u in getattr(result,'users',[]) if str(u.id)==str(contact['user_id'])),None)
+                    code=geo.phone_country(getattr(user,'phone',None)) if user else ''
+                    if code:data.update(detected_country=code,detected_source='Telegram-visible phone country',observed_at=stamp())
+            except (errors.FloodWaitError,errors.PeerFloodError) as exc:
+                if principal:pause_for_telegram(principal,exc)
+                retry=(datetime.now(timezone.utc)+timedelta(seconds=max(1800,getattr(exc,'seconds',86400))+5)).isoformat();error='Country lookup paused by Telegram. No messages were sent.'
+            except Exception as exc:
+                if not isinstance(exc,HTTPException) or exc.status_code!=429:retry=(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat()
+                error='Country lookup unavailable. Choose a country/timezone manually or wait for the original account.'
+            data.update(checked_at=stamp(),lookup_error=error);store_location(key,data,False)
+            db.execute('update country_lookup_queue set slot=?,principal=?,next_attempt_at=?,last_checked_at=?,error=? where key=?',(slot,principal,retry,stamp(),error,key));db.commit()
+            return {'checked':1,'results':[{'key':key,'ok':not bool(error),'country':location_for(key),'error':error}]}
+async def country_check_loop():
+    while True:
+        await asyncio.sleep(30)
+        try:await process_country_checks()
+        except asyncio.CancelledError:raise
+        except Exception:pass
+class LocationUpdate(BaseModel):
+    contact_id:str=Field(max_length=200)
+    country:str=Field(default='',max_length=100)
+    timezone:str=Field(default='',max_length=100)
+@app.get('/locations/options',dependencies=[Depends(auth)])
+async def location_options():return geo.options()
+@app.post('/locations/update',dependencies=[Depends(auth)])
+async def update_location(body:LocationUpdate):
+    try:country=geo.country_code(body.country);zone=geo.zone_name(body.timezone)
+    except ValueError as exc:raise HTTPException(400,str(exc))
+    async with lock:
+        row=db.execute('select data from contacts where id=?',(body.contact_id,)).fetchone()
+        if not row:raise HTTPException(404,'Saved contact not found')
+        contact=json.loads(row[0])
+        if contact.get('kind','dm')!='dm':raise HTTPException(400,'Country scheduling applies to individual contacts.')
+        key=geo_key(contact);data=geo_data(key);data.update(country_override=country,timezone_override=zone,override_source='Manual entry',updated_at=stamp());store_location(key,data)
+        seed_auto_followups()
+        return {'ok':True,'location':location_for(key)}
+@app.post('/locations/check',dependencies=[Depends(auth)])
+async def check_countries():
+    seed_country_checks();return await process_country_checks()
+def followup_timing(first_at,location,now=None,days=3):return geo.timing(first_at,location,now or datetime.now(timezone.utc),days)
+
 def contacts():
     rows=[c for r in db.execute('select data from contacts order by rowid desc') if not (c:=json.loads(r[0])).get('is_bot',False)]
-    return sorted(rows,key=lambda c:c.get('scanned_at') or '',reverse=True)
-def save(c):db.execute('insert or replace into contacts values(?,?)',(c['id'],json.dumps(c)));db.commit()
+    return [{**c,'location':location_for(c)} for c in sorted(rows,key=lambda c:c.get('scanned_at') or '',reverse=True)]
+def save(c):
+    c={k:v for k,v in c.items() if k!='location'}
+    db.execute('insert or replace into contacts values(?,?)',(c['id'],json.dumps(c)));db.commit();queue_country_check(c)
 def session_path(slot):return str(ROOT/('telegram' if slot==1 else f'telegram_{slot}'))
 def make_client(slot):
     r=db.execute('select api_id,api_hash from telegram_api where id=?',(slot,)).fetchone()
@@ -239,6 +356,7 @@ def records():
         d=dict(zip(keys,r));detail=db.execute('select body,recipient_name,username,sender_label,followup_of,token_symbol,exchange,automation_step from message_details where delivery_id=?',(d['delivery_id'],)).fetchone()
         saved=db.execute('select data from contacts where id=?',(d['id'],)).fetchone();contact=json.loads(saved[0]) if saved else {}
         d.update(dict(zip(['message','recipient_name','username','sender_label','followup_of','token_symbol','exchange','automation_step'],detail)) if detail else {'message':None,'recipient_name':contact.get('name',d['target']),'username':contact.get('username',''),'sender_label':f"Account {d['account_id']}",'followup_of':None,'token_symbol':'','exchange':'','automation_step':0})
+        d['location']=location_for(d['kind']+':'+str(d['target']))
         result.append(d)
     return result
 LEAD_STAGES=('New','Contacted','Replied','Meeting','Proposal','Client')
@@ -264,6 +382,8 @@ def record_reply(principal,target,slot,message):
         last=db.execute("select o.at,coalesce(d.telegram_message_id,0) from outbox o left join message_details d on d.delivery_id=o.id where o.principal=? and o.target=? and o.kind='dm' and o.status='Sent' order by o.at desc limit 1",(str(principal),str(target))).fetchone()
         if is_affirmative_reply(text) or (last and (message.id>last[1] if last[1] else at>=datetime.fromisoformat(last[0]).replace(microsecond=0))):
             queue_folder_route(str(principal),str(target),slot,'🟡',force=True)
+        saved=db.execute("select c.data from contacts c join outbox o on o.contact_id=c.id where o.principal=? and o.target=? and o.kind='dm' and o.status='Sent' order by o.at limit 1",(str(principal),str(target))).fetchone()
+        if saved:queue_country_check(json.loads(saved[0]),force=True)
         queue_auto_yes(str(principal),str(target),slot,message)
     return bool(cursor.rowcount)
 def attach_reply_listener(client,slot):
@@ -295,14 +415,15 @@ def lead_records():
         replied=bool(replies);latest_reply=replies[0] if replied else None
         stage=cfg['stage'] or ('Replied' if replied else 'Contacted' if sent else 'New')
         last_sent=sent[0] if sent else None
-        due_at=(datetime.fromisoformat(last_sent['at'])+timedelta(days=cfg['reminder_days'])).isoformat() if last_sent and kind=='dm' else None
+        location=location_for(key);reminder_timing=followup_timing(last_sent['at'],location,days=cfg['reminder_days']) if last_sent and kind=='dm' else {}
+        due_at=reminder_timing.get('due_at')
         reminder_active=bool(kind=='dm' and last_sent and cfg['reminders_enabled'] and not replied and stage!='Client' and not pending)
         sync_rows=db.execute('select principal,checked_at,complete,error from reply_sync where target=?',(target,)).fetchall() if kind=='dm' else []
         principals={d['principal'] for d in sent};sync_rows=[r for r in sync_rows if r[0] in principals]
         sync_error=next((r[3] for r in sync_rows if r[3]),'')
         fully_checked=bool(principals and len(sync_rows)==len(principals) and all(r[2] and not r[3] for r in sync_rows))
         last_activity=max([contact.get('scanned_at') or '',cfg['updated_at'] or '',latest_reply['at'] if replied else '',rows[0]['at'] if rows else ''])
-        result.append({'key':key,'contact_id':contact['id'],'name':contact.get('name',target),'username':contact.get('username',''),'group':contact.get('group',''),'kind':kind,'target':target,'stage':stage,'reply_status':'Replied' if replied else 'Awaiting reply' if sent and kind=='dm' else 'Not tracked' if kind=='group' else 'Not contacted','latest_reply':latest_reply,'replies':replies,'needs_attention':bool(replied and latest_reply['at']>cfg['acknowledged_at'] and stage!='Client'),'reminder_days':cfg['reminder_days'],'reminders_enabled':bool(cfg['reminders_enabled']),'reminder_active':reminder_active,'due_at':due_at if reminder_active else None,'followup_due':bool(reminder_active and datetime.fromisoformat(due_at)<=now),'reminder_reason':'Stopped — reply received' if replied else 'Complete' if stage=='Client' else 'Paused' if not cfg['reminders_enabled'] else 'Review uncertain delivery' if pending else 'Direct messages only' if kind=='group' else 'Waiting for first send' if not last_sent else 'Scheduled','last_sent_at':last_sent['at'] if last_sent else None,'followup_delivery_id':last_sent['delivery_id'] if last_sent else None,'last_activity_at':last_activity,'sync_checked_at':max([r[1] or '' for r in sync_rows],default=''),'sync_complete':fully_checked,'sync_error':sync_error,'folder_routes':folder_route_records(target,principals) if kind=='dm' else [],'auto_followup':auto_followup_summary(target) if kind=='dm' else None,'auto_yes':auto_yes_summary(target,principals) if kind=='dm' else None})
+        result.append({'key':key,'contact_id':contact['id'],'location':location,'name':contact.get('name',target),'username':contact.get('username',''),'group':contact.get('group',''),'kind':kind,'target':target,'stage':stage,'reply_status':'Replied' if replied else 'Awaiting reply' if sent and kind=='dm' else 'Not tracked' if kind=='group' else 'Not contacted','latest_reply':latest_reply,'replies':replies,'needs_attention':bool(replied and latest_reply['at']>cfg['acknowledged_at'] and stage!='Client'),'reminder_days':cfg['reminder_days'],'reminders_enabled':bool(cfg['reminders_enabled']),'reminder_active':reminder_active,'due_at':due_at if reminder_active else None,'followup_due':bool(reminder_active and due_at and reminder_timing.get('in_window')),'reminder_reason':'Stopped — reply received' if replied else 'Complete' if stage=='Client' else 'Paused' if not cfg['reminders_enabled'] else 'Review uncertain delivery' if pending else 'Direct messages only' if kind=='group' else 'Waiting for first send' if not last_sent else 'Timezone required' if not location.get('timezone') else 'Scheduled','last_sent_at':last_sent['at'] if last_sent else None,'followup_delivery_id':last_sent['delivery_id'] if last_sent else None,'last_activity_at':last_activity,'sync_checked_at':max([r[1] or '' for r in sync_rows],default=''),'sync_complete':fully_checked,'sync_error':sync_error,'folder_routes':folder_route_records(target,principals) if kind=='dm' else [],'auto_followup':auto_followup_summary(target) if kind=='dm' else None,'auto_yes':auto_yes_summary(target,principals) if kind=='dm' else None})
     return sorted(result,key=lambda r:r['last_activity_at'],reverse=True)
 
 class LeadUpdate(BaseModel):
@@ -506,7 +627,7 @@ def is_negative_reply(text):
     if '?' in str(text):return False
     return ' '.join(re.sub(r"[^a-z0-9\s]",'',str(text).casefold()).split()) in {'no','nope','nah','no i am not','no im not','no thats not me','no that is not me'}
 def is_opt_out(text):return bool(re.search(r"\b(stop|unsubscribe|not interested|no thanks|no thank you|dont message|do not message|dont contact|do not contact)\b",str(text).casefold().replace("'",'')))
-def arm_auto_yes(principal,target,slot,root_id,contact_id,exchange,token_symbol,pitch,demo,no_reply):
+def arm_auto_yes(principal,target,slot,root_id,contact_id,exchange,token_symbol,pitch,demo,no_reply=''):
     db.execute('insert or ignore into auto_yes_enrollments(principal,target,root_id,contact_id,slot,exchange,token_symbol,pitch,demo,enabled,armed_at,no_reply) values(?,?,?,?,?,?,?,?,?,?,?,?)',(principal,target,root_id,contact_id,slot,exchange,token_symbol,pitch,demo,1,stamp(),no_reply));db.commit()
 def queue_auto_yes(principal,target,slot,message):
     enrollment=db.execute('select root_id,contact_id,exchange,token_symbol,pitch,demo,enabled,no_reply from auto_yes_enrollments where principal=? and target=?',(principal,target)).fetchone()
@@ -518,15 +639,17 @@ def queue_auto_yes(principal,target,slot,message):
     at=message.date.replace(tzinfo=message.date.tzinfo or timezone.utc)
     if (message.id<=root[1] if root[1] else at<datetime.fromisoformat(root[0]).replace(microsecond=0)):return
     if getattr(message,'fwd_from',None):return
-    if is_opt_out(text):
-        db.execute('update auto_yes_enrollments set enabled=0 where principal=? and target=?',(principal,target))
-        db.execute("update auto_yes_jobs set status='Cancelled',error='Stopped after an opt-out' where principal=? and target=? and status not in ('Complete','Cancelled') and reply_id<?",(principal,target,message.id));db.commit();return
+    if not is_affirmative_reply(text):
+        if is_negative_reply(text) or is_opt_out(text):db.execute('update auto_yes_enrollments set enabled=0 where principal=? and target=?',(principal,target))
+        changed=db.execute("update auto_yes_jobs set status='Cancelled',error='Stopped after a non-affirmative reply' where principal=? and target=? and status not in ('Complete','Cancelled') and reply_id<?",(principal,target,message.id)).rowcount
+        if changed:db.execute('update auto_yes_enrollments set enabled=0 where principal=? and target=?',(principal,target))
+        db.commit();return
     if not enabled or getattr(message,'fwd_from',None):return
-    branch='yes' if is_affirmative_reply(text) else 'no' if is_negative_reply(text) else None
+    branch='yes' if is_affirmative_reply(text) else None
     if not branch:return
     contact=db.execute('select data from contacts where id=?',(cid,)).fetchone()
     if not contact:return
-    contact=json.loads(contact[0]);texts=[personalize_message(value,contact,token,exchange) for value in ((pitch,demo) if branch=='yes' else (no_reply or DEFAULT_NO_REPLY,''))]
+    contact=json.loads(contact[0]);texts=[personalize_message(value,contact,token,exchange) for value in (pitch,demo)]
     db.execute('insert or ignore into auto_yes_jobs(id,principal,target,reply_id,root_id,pitch,demo,created_at,branch) values(?,?,?,?,?,?,?,?,?)',(uuid.uuid4().hex,principal,target,message.id,root_id,*texts,stamp(),branch));db.commit()
 def auto_yes_summary(target,principals):
     row=db.execute('select principal,exchange,token_symbol,enabled from auto_yes_enrollments where target=? order by armed_at desc',(target,)).fetchall()
@@ -534,12 +657,12 @@ def auto_yes_summary(target,principals):
     if not row:return None
     principal,exchange,token,enabled=row
     job=db.execute('select id,status,step,error,branch from auto_yes_jobs where principal=? and target=?',(principal,target)).fetchone()
-    status=job[1] if job else 'Waiting for yes / no'
+    status=job[1] if job else 'Waiting for a clear yes'
     if status not in ('Complete','Cancelled','Needs attention') and (not enabled or not settings()['auto_yes_enabled']):status='Paused'
-    return {'exchange':exchange,'exchange_name':EXCHANGES.get(exchange,exchange),'token_symbol':token,'enabled':bool(enabled),'status':status,'sent_parts':job[2] if job else 0,'error':job[3] if job else '','job_id':job[0] if job else None,'branch':job[4] if job else None,'completed_once':bool(job and job[1]=='Complete'),'total_parts':(1 if job[4]=='no' else 2) if job else 0}
+    return {'exchange':exchange,'exchange_name':EXCHANGES.get(exchange,exchange),'token_symbol':token,'enabled':bool(enabled),'status':status,'sent_parts':job[2] if job else 0,'error':job[3] if job else '','job_id':job[0] if job else None,'branch':job[4] if job else None,'completed_once':bool(job and job[1]=='Complete'),'total_parts':2 if job and job[4]=='yes' else 0}
 def validate_auto_yes_send(job_id,principal,target):
-    row=db.execute('select j.status,e.enabled from auto_yes_jobs j join auto_yes_enrollments e on e.principal=j.principal and e.target=j.target where j.id=? and j.principal=? and j.target=?',(job_id,principal,target)).fetchone()
-    if not row or row[0] in ('Cancelled','Complete','Needs attention'):raise HTTPException(409,'This automatic sequence is no longer pending')
+    row=db.execute('select j.status,e.enabled,j.branch from auto_yes_jobs j join auto_yes_enrollments e on e.principal=j.principal and e.target=j.target where j.id=? and j.principal=? and j.target=?',(job_id,principal,target)).fetchone()
+    if not row or row[2]!='yes' or row[0] in ('Cancelled','Complete','Needs attention'):raise HTTPException(409,'This automatic sequence is no longer pending')
     if not row[1] or not settings()['auto_yes_enabled']:raise HTTPException(423,'Automatic replies are paused')
 class AutoYesControl(BaseModel):
     key:str=Field(max_length=100)
@@ -557,9 +680,9 @@ async def update_auto_yes(body:AutoYesControl):
 async def process_auto_yes(limit=1):
     async with auto_yes_lock:
         if not settings()['auto_yes_enabled']:return {'processed':0,'results':[]}
-        rows=db.execute("select j.id,j.principal,j.target,j.root_id,j.pitch,j.demo,j.step,e.slot,e.contact_id,e.exchange,e.token_symbol,j.branch from auto_yes_jobs j join auto_yes_enrollments e on e.principal=j.principal and e.target=j.target where j.status in ('Pending','Paused') and e.enabled=1 and j.next_attempt_at<=? order by j.created_at limit ?",(stamp(),limit)).fetchall();results=[]
+        rows=db.execute("select j.id,j.principal,j.target,j.root_id,j.pitch,j.demo,j.step,e.slot,e.contact_id,e.exchange,e.token_symbol,j.branch from auto_yes_jobs j join auto_yes_enrollments e on e.principal=j.principal and e.target=j.target where j.branch='yes' and j.status in ('Pending','Paused') and e.enabled=1 and j.next_attempt_at<=? order by j.created_at limit ?",(stamp(),limit)).fetchall();results=[]
         for job_id,principal,target,root_id,pitch,demo,step,preferred,cid,exchange,token,branch in rows:
-            current_part=step+1;total_parts=1 if branch=='no' else 2
+            current_part=step+1;total_parts=2
             try:
                 try:client,slot=await folder_client(principal,preferred)
                 except HTTPException:raise HTTPException(409,'Reconnect the original sender to continue the automatic sequence')
@@ -593,8 +716,13 @@ async def auto_yes_loop():
 def seed_auto_followups():
     rows=db.execute("select o.id,o.principal,o.target,o.slot,o.contact_id,o.at,coalesce(d.token_symbol,''),coalesce(d.exchange,'') from outbox o left join message_details d on d.delivery_id=o.id where o.kind='dm' and o.status='Sent' and d.followup_of is null order by o.at,o.rowid").fetchall()
     for root,principal,target,slot,cid,at,token,exchange in rows:
-        due=(datetime.fromisoformat(at)+timedelta(days=3)).isoformat()
-        db.execute("insert or ignore into auto_followup_jobs(root_id,principal,target,slot,contact_id,due_at,token_symbol,exchange) values(?,?,?,?,?,?,?,?)",(root,principal,target,slot,cid,due,token,exchange))
+        timing=followup_timing(at,location_for('dm:'+target));due=timing['due_at'] or ''
+        status='Needs timezone' if timing['needs_timezone'] else 'Scheduled'
+        error='Choose this contact’s timezone to schedule the 10:00 local follow-up.' if timing['needs_timezone'] else ''
+        db.execute("insert or ignore into auto_followup_jobs(root_id,principal,target,slot,contact_id,due_at,token_symbol,exchange,status,error) values(?,?,?,?,?,?,?,?,?,?)",(root,principal,target,slot,cid,due,token,exchange,status,error))
+        existing=db.execute('select status,due_at from auto_followup_jobs where root_id=?',(root,)).fetchone()
+        if existing and existing[0] not in ('Complete','Cancelled','Needs attention','Sending') and (existing[1]!=due or existing[0]=='Needs timezone' and not timing['needs_timezone']):
+            db.execute("update auto_followup_jobs set due_at=?,status=?,error=?,next_attempt_at='' where root_id=?",(due,status,error,root))
     db.commit()
 def auto_followup_gate(job):
     root,principal,target=job[:3]
@@ -612,20 +740,26 @@ def auto_followup_summary(target):
     if not row:
         root=db.execute("select o.id,o.principal,o.target,o.slot,o.at from outbox o left join message_details d on d.delivery_id=o.id where o.kind='dm' and o.status='Sent' and o.target=? and d.followup_of is null order by o.at,o.rowid limit 1",(target,)).fetchone()
         if not root:return None
-        row=(*root[:4],(datetime.fromisoformat(root[4])+timedelta(days=3)).isoformat(),'Scheduled','')
+        timing=followup_timing(root[4],location_for('dm:'+target))
+        row=(*root[:4],timing['due_at'] or '', 'Needs timezone' if timing['needs_timezone'] else 'Scheduled','')
     root,principal,target,slot,due,status,error=row
+    first=db.execute('select at from outbox where id=?',(root,)).fetchone()
+    location=location_for('dm:'+target);timing=followup_timing(first[0],location) if first else {}
     if status not in ('Complete','Cancelled','Needs attention'):
         gate,reason=auto_followup_gate((root,principal,target))
         if gate:status,error=gate,reason
     current=db.execute('select slot from account_info where principal=? order by slot limit 1',(principal,)).fetchone()
-    return {'root_id':root,'principal':principal,'account_id':current[0] if current else slot,'due_at':due,'status':status,'error':error,'days':3,'enabled':bool(settings()['auto_followup_enabled'] and lead_config('dm:'+target)['reminders_enabled'])}
+    return {'root_id':root,'principal':principal,'account_id':current[0] if current else slot,'due_at':due or None,'next_send_at':timing.get('next_available_at') if status not in ('Complete','Cancelled','Needs attention','Needs timezone') else None,'timezone':location.get('timezone',''),'needs_timezone':not bool(location.get('timezone')),'local_send_time':'10:00','send_window':'10:00–11:00 local','status':status,'error':error,'days':3,'enabled':bool(settings()['auto_followup_enabled'] and lead_config('dm:'+target)['reminders_enabled'])}
 def validate_auto_followup_send(root_id,principal,target):
     row=db.execute('select root_id,principal,target,due_at,status from auto_followup_jobs where root_id=?',(root_id,)).fetchone()
     if not row or row[1:3]!=(principal,target):raise HTTPException(409,'Automatic follow-up must use the first message sender and recipient')
     if row[4] in ('Cancelled','Complete','Needs attention'):raise HTTPException(409,'This automatic follow-up is no longer pending')
     gate,reason=auto_followup_gate(row)
     if gate:raise HTTPException(423 if gate=='Paused' else 409,reason)
-    if datetime.fromisoformat(row[3])>datetime.now(timezone.utc):raise HTTPException(409,'The three-day follow-up is not due yet')
+    first=db.execute('select at from outbox where id=?',(root_id,)).fetchone()[0]
+    timing=followup_timing(first,location_for('dm:'+target))
+    if timing['needs_timezone']:raise HTTPException(425,{'code':'local_send_time','message':'Choose the contact’s timezone before automatic follow-up.'})
+    if not timing['in_window']:raise HTTPException(425,{'code':'local_send_time','message':'Waiting for the contact’s 10:00 local send window.','next_available_at':timing['next_available_at']})
     sync=db.execute('select checked_at,complete,error from reply_sync where principal=? and target=?',(principal,target)).fetchone()
     if not sync or not sync[1] or sync[2] or not sync[0] or datetime.now(timezone.utc)-datetime.fromisoformat(sync[0])>timedelta(minutes=2):raise HTTPException(409,'Reply history must be fully checked before the automatic follow-up')
 async def process_auto_followups(limit=1):
@@ -642,6 +776,10 @@ async def process_auto_followups(limit=1):
                 try:client,slot=await folder_client(principal,preferred)
                 except (HTTPException,errors.RPCError,OSError):raise HTTPException(503,'Reconnect the original sender; no other account will be used')
                 first=db.execute('select at from outbox where id=?',(root,)).fetchone()[0]
+                timing=followup_timing(first,location_for('dm:'+target))
+                if timing['needs_timezone']:
+                    state='Needs timezone';raise HTTPException(425,{'code':'local_send_time','message':'Choose the contact’s timezone before automatic follow-up.'})
+                if not timing['in_window']:raise HTTPException(425,{'code':'local_send_time','message':'Waiting for the contact’s 10:00 local send window.','next_available_at':timing['next_available_at']})
                 sync=await sync_reply_pair(principal,target,slot,first)
                 gate,reason=auto_followup_gate((root,principal,target))
                 if gate:
@@ -656,11 +794,11 @@ async def process_auto_followups(limit=1):
                 await deliver(cid,slot,'dm',body,followup_of=root,request_id='auto-followup:'+root,expected_principal=principal,token_symbol=token,exchange=exchange,automatic_followup=root)
                 state='Complete'
             except Exception as exc:
-                error=str(exc.detail) if isinstance(exc,HTTPException) else 'Automatic follow-up failed. Check delivery history.'
+                error=(exc.detail.get('message',str(exc.detail)) if isinstance(exc.detail,dict) else str(exc.detail)) if isinstance(exc,HTTPException) else 'Automatic follow-up failed. Check delivery history.'
                 attempt=db.execute('select o.status from followup_requests f join outbox o on o.id=f.delivery_id where f.request_id=?',('auto-followup:'+root,)).fetchone()
                 if attempt and attempt[0]=='Sent':state='Complete';error=''
                 elif attempt:state='Needs attention'
-                elif isinstance(exc,HTTPException) and exc.status_code in (429,503):state='Waiting'
+                elif isinstance(exc,HTTPException) and exc.status_code in (429,503,425):state='Needs timezone' if state=='Needs timezone' else 'Waiting'
                 elif isinstance(exc,HTTPException) and exc.status_code==423:state='Paused'
                 elif state=='Waiting':
                     gate,reason=auto_followup_gate((root,principal,target))
@@ -679,20 +817,21 @@ async def auto_followup_loop():
 
 @app.on_event('startup')
 async def start():
-    global reply_task,folder_task,auto_yes_task,auto_followup_task
-    seed_folder_routes();seed_auto_followups()
+    global reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task
+    seed_folder_routes();seed_auto_followups();seed_country_checks()
     for slot in (1,2,3):
         try:
             c=make_client(slot)
             if c:clients[slot]=c;await c.connect()
         except Exception:startup_errors[slot]='Telegram connection unavailable. Reconnect this account in Connections.'
+    geo_task=asyncio.create_task(country_check_loop())
     reply_task=asyncio.create_task(reply_sync_loop())
     folder_task=asyncio.create_task(folder_routing_loop())
     auto_yes_task=asyncio.create_task(auto_yes_loop())
     auto_followup_task=asyncio.create_task(auto_followup_loop())
 @app.on_event('shutdown')
 async def stop():
-    for task in (reply_task,folder_task,auto_yes_task,auto_followup_task):
+    for task in (reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task):
         if task:
             task.cancel()
             try:await task
@@ -734,7 +873,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.8'},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.9'},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -768,9 +907,9 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
-    return {'version':'3.8','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'contact_import':True,'template_variants':True}}
+    return {'version':'3.9','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
-WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches')
+WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue')
 def workspace_reset_counts():
     count=lambda table:db.execute('select count(*) from '+table).fetchone()[0]
     return {'contacts':count('contacts'),'messages':count('outbox'),'replies':count('replies'),'leads':len(lead_records()),'automations':count('auto_yes_jobs')+count('auto_yes_enrollments')+count('auto_followup_jobs')}
@@ -922,7 +1061,7 @@ async def scan(body:Scan):
                 rank=getattr(p,'rank',None) or ''
                 owner=isinstance(p,(types.ChannelParticipantCreator,types.ChatParticipantCreator))
                 c={'id':str(entity.id)+':'+str(u.id),'user_id':str(u.id),'name':(' '.join(filter(None,[u.first_name,u.last_name])) or 'Unnamed admin'),'username':u.username or '', 'group':entity.title,'link':body.link,'role':'Owner' if owner else (rank or 'Admin'),'title':rank,'source':'Telegram admin title' if rank else 'Telegram permissions','scanned_at':stamp(),'status':'Ready','is_bot':False,'scan_account':body.account_id,'group_id':str(utils.get_peer_id(entity))}
-                save(c);result.append(c)
+                save(c);observe_public_phone(c,u);c['location']=location_for(c);result.append(c)
             group={'id':'group:'+str(utils.get_peer_id(entity)),'name':entity.title,'username':getattr(entity,'username','') or '', 'role':'Group chat','group':entity.title,'link':body.link,'group_id':str(utils.get_peer_id(entity)),'kind':'group','scan_account':body.account_id,'source':'Telegram group','scanned_at':stamp(),'status':'Ready'}
             stored=db.execute('select data from contacts where id=?',(group['id'],)).fetchone()
             group['membership']=json.loads(stored[0]).get('membership',{}) if stored else {}
@@ -973,13 +1112,14 @@ async def config(body:Config):
     return {'ok':True}
 @app.post('/templates',dependencies=[Depends(auth)])
 async def save_templates(body:Templates):
-    values={k:(v.strip() if isinstance(v,str) else v) for k,v in body.model_dump(exclude_none=True).items()}
+    values={k:(v.strip() if isinstance(v,str) else v) for k,v in body.model_dump(exclude_none=True).items() if k!='no_reply_template'}
     if any(isinstance(v,str) and not v for v in values.values()):raise HTTPException(400,'Message templates must contain text')
     async with lock:
         cfg=settings();variants=values.pop('template_variants',None)
         pools=copy.deepcopy(cfg['template_variants'])
         if variants is not None:
-            if set(variants)!=set(TEMPLATE_KEYS):raise HTTPException(400,'Provide five options for each of the five message types.')
+            variants={key:options for key,options in variants.items() if key!='no_reply_template'}
+            if set(variants)!=set(TEMPLATE_KEYS):raise HTTPException(400,'Provide five options for each of the four message types.')
             for key,options in variants.items():
                 if len(options)!=5 or any(len(text)>4096 for text in options):raise HTTPException(400,'Each message type needs five slots, up to 4,096 characters each.')
                 options=[text.strip() for text in options]
@@ -1037,9 +1177,10 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
             except (ValueError,TypeError):raise HTTPException(409,'Telegram could not find this imported username. Check the link or scan the group first.')
             if kind=='dm' and (not isinstance(resolved,types.User) or getattr(resolved,'bot',False) or getattr(resolved,'deleted',False)):raise HTTPException(400,'This imported link is not a person. Use a Group chat import or Find team for groups; bots are excluded.')
             if kind=='group' and not (isinstance(resolved,types.Chat) or getattr(resolved,'megagroup',False)):raise HTTPException(400,'This imported link is not a group chat. Channels cannot receive group messages.')
+            old_geo_key=geo_key(contact)
             field='group_id' if kind=='group' else 'user_id'
             contact[field]=str(utils.get_peer_id(resolved) if kind=='group' else resolved.id)
-            contact['import_unresolved']=False;save(contact);resolved_peer=resolved
+            contact['import_unresolved']=False;migrate_location(old_geo_key,geo_key(contact));save(contact);resolved_peer=resolved
         text=(message if message is not None else choose_template('template')).strip()
         if not text:raise HTTPException(400,'Write your message before sending')
         symbol=normalize_token(settings().get('token_symbol','') if token_symbol is None else token_symbol)
@@ -1057,12 +1198,11 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         if auto_yes:
             if kind!='dm' or followup_of:raise HTTPException(400,'Automatic replies can be enabled only on a new direct message')
             if not exchange or not symbol:raise HTTPException(400,'Select the exchange and enter the token to enable automatic replies')
-            if auto_reply_templates is not None and set(auto_reply_templates)!={'yes_pitch_template','yes_demo_template','no_reply_template'}:raise HTTPException(400,'Provide all three automatic reply previews.')
-            for key in ('yes_pitch_template','yes_demo_template','no_reply_template'):
+            if auto_reply_templates is not None and set(auto_reply_templates)-{'no_reply_template'}!={'yes_pitch_template','yes_demo_template'}:raise HTTPException(400,'Provide both affirmative reply previews.')
+            for key in ('yes_pitch_template','yes_demo_template'):
                 yes_cfg[key]=choose_template(key,yes_cfg,auto_reply_templates[key] if auto_reply_templates else None)
             personalize_message(yes_cfg['yes_pitch_template'],contact,symbol,exchange)
             personalize_message(yes_cfg['yes_demo_template'],contact,symbol,exchange)
-            personalize_message(yes_cfg['no_reply_template'],contact,symbol,exchange)
         text=personalize_message(text,contact,symbol,exchange)
         digest=hashlib.sha256(text.encode()).hexdigest()
         target=str(contact['group_id'] if kind=='group' else contact['user_id'])
@@ -1096,6 +1236,7 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         except (errors.FloodWaitError,errors.PeerFloodError) as exc:
             pause_for_telegram(principal,exc);raise
         except (ValueError,TypeError):raise HTTPException(409,'This sender cannot resolve the recipient. Scan its group with this account first.')
+        if kind=='dm':observe_public_phone(contact,peer)
         if kind=='dm' and getattr(peer,'bot',False):raise HTTPException(400,'This contact is a Telegram bot. Bot admins are excluded.')
         if kind=='group' and not (isinstance(peer,types.Chat) or getattr(peer,'megagroup',False)):raise HTTPException(400,'The selected destination is not a group chat')
         delivery_id=uuid.uuid4().hex
@@ -1122,8 +1263,8 @@ async def deliver(cid,slot=1,kind='dm',message=None,followup_of=None,request_id=
         advance_lead(kind+':'+target,'Contacted')
         if kind=='dm':
             db.execute('update message_details set telegram_message_id=? where delivery_id=?',(getattr(sent_message,'id',0) or 0,delivery_id));db.commit()
-            queue_folder_route(principal,target,slot,'🔵',force=True)
-            if auto_yes:arm_auto_yes(principal,target,slot,delivery_id,cid,exchange,symbol,yes_cfg['yes_pitch_template'],yes_cfg['yes_demo_template'],yes_cfg['no_reply_template'])
+            queue_folder_route(principal,target,slot,'🔵',force=True);queue_country_check(contact,force=True)
+            if auto_yes:arm_auto_yes(principal,target,slot,delivery_id,cid,exchange,symbol,yes_cfg['yes_pitch_template'],yes_cfg['yes_demo_template'])
         return {'status':'Sent','id':cid,'account_id':slot,'kind':kind,'usage':usage(principal)}
 @app.post('/send',dependencies=[Depends(auth)])
 async def send(body:Send):return await deliver(body.id,body.account_id,body.kind,body.message,token_symbol=body.token_symbol,exchange=body.exchange,auto_yes=body.auto_yes,auto_reply_templates=body.auto_reply_templates)
@@ -1195,6 +1336,7 @@ def import_candidates(rows,mapping,has_header,default_kind):
         item={'row':number,'telegram':value(row,'telegram'),'name':value(row,'name'),'status':'Ready','reason':''}
         try:
             handle=importer.telegram_handle(item['telegram'])
+            country=geo.country_code(value(row,'country'));zone=geo.zone_name(value(row,'timezone'))
             kind=value(row,'kind').strip().lower() or default_kind
             if kind in ('person','people','user','contact'):kind='dm'
             if kind in ('gc','group chat','groupchat'):kind='group'
@@ -1203,8 +1345,9 @@ def import_candidates(rows,mapping,has_header,default_kind):
             else:
                 cid='import:'+kind+':'+handle
                 c={'id':cid,'name':item['name'] or '@'+handle,'username':handle,'user_id':cid if kind=='dm' else '', 'group_id':cid if kind=='group' else '', 'kind':kind,'role':value(row,'role') or ('Group chat' if kind=='group' else 'Imported contact'),'group':value(row,'group') or 'Spreadsheet import','link':'https://t.me/'+handle,'source':'Spreadsheet import · role not verified','status':'Ready','is_bot':False,'import_unresolved':True}
+                if kind=='dm' and (country or zone):c['import_location']={'country_override':country,'timezone_override':zone,'override_source':'Spreadsheet import','updated_at':stamp()}
                 candidates.append(c);seen.add(handle)
-            item.update(username=handle,kind=kind,name=item['name'] or '@'+handle)
+            item.update(username=handle,kind=kind,name=item['name'] or '@'+handle,country=geo.COUNTRIES.get(country,'Unknown'),timezone=zone or geo.profile({'country_override':country})['timezone'])
         except ValueError as exc:item.update(status='Skipped',reason=str(exc))
         items.append(item)
     return candidates,items
@@ -1226,6 +1369,8 @@ async def confirm_import(body:ImportConfirm):
             for c in payload['contacts']:
                 if c['username'] in known:duplicates+=1;continue
                 c.update(scanned_at=stamp(),imported_at=stamp(),import_source=payload['source'])
+                imported_location=c.pop('import_location',None)
+                if imported_location:store_location(geo_key(c),imported_location,False)
                 db.execute('insert or ignore into contacts values(?,?)',(c['id'],json.dumps(c)))
                 known.add(c['username']);added+=1
             db.execute('delete from import_batches where id=?',(body.batch_id,))
@@ -1242,13 +1387,13 @@ def sync_sheet():
     gc=gspread.service_account_from_dict(json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']))
     book=gc.open_by_url(cfg['sheet_url'])
     try:ws=book.worksheet('TeamRadar')
-    except gspread.WorksheetNotFound:ws=book.add_worksheet('TeamRadar',rows=1000,cols=12)
+    except gspread.WorksheetNotFound:ws=book.add_worksheet('TeamRadar',rows=1000,cols=16)
     existing=ws.get_all_values();checks={r[0]:r[6] for r in existing[1:] if len(r)>6}
-    rows=[['Contact ID','Name','Username','Role / title','Group','Profile','Send message','Delivery status','Scanned at']]
+    rows=[['Contact ID','Name','Username','Role / title','Group','Profile','Send message','Delivery status','Scanned at','Country','Country source','Timezone']]
     for c in contacts():
         if c.get('kind')=='group':continue
         d=db.execute('select status from outbox where contact_id=? order by at desc limit 1',(c['id'],)).fetchone()
-        rows.append([c['id'],c['name'],'@'+c['username'] if c['username'] else '',c['role'],c['group'],'https://t.me/'+c['username'] if c['username'] else '',checks.get(c['id'],'FALSE'),d[0] if d else 'Ready',c['scanned_at']])
+        rows.append([c['id'],c['name'],'@'+c['username'] if c['username'] else '',c['role'],c['group'],'https://t.me/'+c['username'] if c['username'] else '',checks.get(c['id'],'FALSE'),d[0] if d else 'Ready',c['scanned_at'],c['location']['country_name'],c['location']['country_source'],c['location']['timezone']])
     ws.clear();ws.update(values=rows,range_name='A1',value_input_option='RAW');ws.freeze(rows=1)
     if len(rows)>1:book.batch_update({'requests':[{'setDataValidation':{'range':{'sheetId':ws.id,'startRowIndex':1,'endRowIndex':len(rows),'startColumnIndex':6,'endColumnIndex':7},'rule':{'condition':{'type':'BOOLEAN'},'strict':True,'showCustomUi':True}}}]})
     return {'ok':True,'rows':len(rows)-1}

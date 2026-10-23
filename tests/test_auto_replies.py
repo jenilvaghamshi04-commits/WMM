@@ -22,9 +22,16 @@ class AutomaticReplyTests(unittest.TestCase):
         self.assertEqual(self.app.usage('101')['dm']['used'],1)
         a=self.app.auto_yes_summary('999',{'101'});self.assertEqual((a['status'],a['sent_parts'],a['total_parts']),('Complete',2,2))
         self.assertEqual(sum(d['automation_step']>0 for d in self.app.records()),2)
-    def test_no_one_exact_message_once(self):
+    def test_legacy_negative_job_is_cancelled_on_upgrade(self):
+        self.arm();self.reply('yes');self.app.db.execute("update auto_yes_jobs set branch='no',pitch='Legacy negative offer'");self.app.db.commit()
+        self.app.db.close();self.load();self.app.clients[1]=self.client;self.process()
+        self.assertEqual(len(self.client.sent),1);self.assertEqual(self.app.db.execute('select status from auto_yes_jobs').fetchone()[0],'Cancelled')
+    def test_non_affirmative_reply_cancels_queued_yes_before_any_response(self):
+        self.arm();self.reply('yes');self.reply('Let me check with our team',501);self.process()
+        self.assertEqual(len(self.client.sent),1);self.assertEqual(self.app.auto_yes_summary('999',{'101'})['status'],'Cancelled')
+    def test_no_receives_no_automatic_response(self):
         self.arm();self.reply('no');self.process();self.reply('nope',501);self.process()
-        self.assertEqual([t for _,t in self.client.sent[1:]],[self.app.DEFAULT_NO_REPLY]);self.assertEqual(self.app.auto_yes_summary('999',{'101'})['total_parts'],1)
+        self.assertEqual(len(self.client.sent),1);self.assertEqual(self.app.auto_yes_summary('999',{'101'})['total_parts'],0)
     def test_ambiguous_and_forwarded_wait(self):
         self.arm()
         for i,text in enumerate(['maybe','yes?','yesterday','no problem','yes but no','no?','sure?']):self.reply(text,500+i)
@@ -36,12 +43,11 @@ class AutomaticReplyTests(unittest.TestCase):
         self.arm();self.app.db.execute('update message_details set telegram_message_id=1000');self.app.db.commit();self.reply('yes',500);self.process();self.assertEqual(len(self.client.sent),1)
     def test_no_old_conversations_autoenrolled(self):
         c=self.sender();cid=self.contact(999);self.run_async(self.app.deliver(cid,message='Hello'));self.reply();self.process();self.assertEqual(len(c.sent),1)
-    def test_templates_snapshotted_and_optional_legacy_updates_preserve(self):
-        self.run_async(self.app.save_templates(self.app.Templates(template='Hello',followup_template='Follow',no_reply_template='Original no @username {{exchange}} @TOKEN')))
-        self.arm();self.run_async(self.app.save_templates(self.app.Templates(template='New initial',followup_template='New follow',no_reply_template='Changed no')))
-        self.reply('no');self.process();self.assertEqual(self.client.sent[-1][1],'Original no Person 999 Bitget $ABC')
-        self.run_async(self.app.save_templates(self.app.Templates(template='Old client',followup_template='Preserve')))
-        self.assertEqual(self.app.settings()['no_reply_template'],'Changed no')
+    def test_affirmative_templates_snapshotted_and_legacy_negative_template_ignored(self):
+        self.run_async(self.app.save_templates(self.app.Templates(template='Hello',followup_template='Follow',yes_pitch_template='Original pitch @username {{exchange}} @TOKEN')))
+        self.arm();self.run_async(self.app.save_templates(self.app.Templates(template='New initial',followup_template='New follow',yes_pitch_template='Changed pitch',no_reply_template='Ignored legacy offer')))
+        self.reply('yes');self.process();self.assertEqual(self.client.sent[1][1],'Original pitch Person 999 Bitget $ABC')
+        self.assertNotIn('no_reply_template',self.app.settings())
     def test_global_and_per_contact_pause(self):
         self.arm();self.reply();self.run_async(self.app.save_templates(self.app.Templates(template='Hello',followup_template='Follow',auto_yes_enabled=False)));self.process();self.assertEqual(len(self.client.sent),1)
         self.run_async(self.app.save_templates(self.app.Templates(template='Hello',followup_template='Follow',auto_yes_enabled=True)))
@@ -64,7 +70,7 @@ class AutomaticReplyTests(unittest.TestCase):
     def test_crash_after_confirmed_part_reuses_outbox(self):
         self.arm();self.reply();self.process();self.app.db.execute("update auto_yes_jobs set step=0,status='Pending'");self.app.db.execute("update auto_yes_enrollments set enabled=1");self.app.db.commit();self.process();self.assertEqual(len(self.client.sent),3);self.assertEqual(self.app.auto_yes_summary('999',{'101'})['status'],'Complete')
     def test_restart_keeps_pending_job_and_no_replay(self):
-        self.arm();self.reply('no');self.app.db.close();self.load();self.app.clients[1]=self.client;self.process();self.reply('no');self.process();self.assertEqual(len(self.client.sent),2)
+        self.arm();self.reply('no');self.app.db.close();self.load();self.app.clients[1]=self.client;self.process();self.reply('no');self.process();self.assertEqual(len(self.client.sent),1)
     def test_exchange_and_token_required_before_initial(self):
         c=self.sender();cid=self.contact(999)
         for exchange,token in [('', 'ABC'),('invalid','ABC'),('bitget','')]:

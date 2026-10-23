@@ -8,7 +8,7 @@
   root.WMMTemplateVariants={normalize,pick};
 })(typeof window==='undefined'?globalThis:window);
 let savedTemplateVariants={},templateVariantDrafts={},templateVariantActive={},contactAutoTemplates=null,initialBatchPlan=null;
-function legacyTemplateValue(key){return ({template:savedTemplate,followup_template:savedFollowupTemplate,yes_pitch_template:savedYesPitch,yes_demo_template:savedYesDemo,no_reply_template:savedNoReply})[key]||({template:WMMMessageModel.introduction,followup_template:WMMMessageModel.followup,yes_pitch_template:WMMMessageModel.yesPitch,yes_demo_template:WMMMessageModel.yesDemo,no_reply_template:WMMMessageModel.noReply})[key]}
+function legacyTemplateValue(key){return ({template:savedTemplate,followup_template:savedFollowupTemplate,yes_pitch_template:savedYesPitch,yes_demo_template:savedYesDemo})[key]||({template:WMMMessageModel.introduction,followup_template:WMMMessageModel.followup,yes_pitch_template:WMMMessageModel.yesPitch,yes_demo_template:WMMMessageModel.yesDemo})[key]}
 function hydrateTemplateVariants(cfg){
   const previous=JSON.stringify(savedTemplateVariants);savedTemplateVariants={};
   for(const [,key,fallback] of templateFields)savedTemplateVariants[key]=WMMTemplateVariants.normalize(cfg.template_variants?.[key],cfg[key]||WMMMessageModel[fallback]);
@@ -55,7 +55,7 @@ function chooseContactInitial(){
 }
 function chooseContactAutoTemplates(){
   contactAutoTemplates={};const choices=[];
-  for(const [key,label] of [['yes_pitch_template','yes pitch'],['yes_demo_template','call invitation'],['no_reply_template','no reply']]){const pick=pickSavedTemplate(key);contactAutoTemplates[key]=pick.text;choices.push(label+' option '+(pick.index+1));}
+  for(const [key,label] of [['yes_pitch_template','yes pitch'],['yes_demo_template','call invitation']]){const pick=pickSavedTemplate(key);contactAutoTemplates[key]=pick.text;choices.push(label+' option '+(pick.index+1));}
   document.getElementById('contactAutoVariantChoice').textContent='Selected for this contact: '+choices.join(' · ')+'. These texts are kept with this conversation.';
 }
 function chooseFollowupTemplate(){

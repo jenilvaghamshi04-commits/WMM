@@ -16,7 +16,7 @@ class TemplateVariantTests(unittest.TestCase):
     def test_legacy_settings_migrate_to_option_one_without_changing_messages(self):
         self.run_async(self.app.save_templates(self.app.Templates(template='Existing introduction',followup_template='Existing follow-up')))
         cfg=self.app.settings();self.assertEqual(cfg['template_variants']['template'],['Existing introduction','','','','']);self.assertEqual(cfg['template_variants']['followup_template'][0],'Existing follow-up');self.assertEqual(cfg['yes_demo_template'],self.app.DEFAULT_YES_DEMO)
-    def test_all_twenty_five_options_persist_after_reload(self):
+    def test_all_twenty_options_persist_after_reload(self):
         pools=self.store();self.app.db.close();self.load();self.assertEqual(self.app.settings()['template_variants'],pools)
         self.assertTrue(self.run_async(self.app.status())['features']['template_variants'])
     def test_empty_slots_allowed_but_blank_type_bad_count_unknown_type_oversize_rejected(self):
@@ -38,7 +38,7 @@ class TemplateVariantTests(unittest.TestCase):
         pools=self.pools();pools['template']=['','Initial two','','','Initial five'];self.store(pools)
         with patch.object(self.app.secrets,'choice',side_effect=lambda choices:choices[-1]) as pick:
             self.assertEqual(self.app.choose_template('template'),'Initial five');self.assertEqual(pick.call_args.args[0],['Initial two','Initial five'])
-            self.assertEqual(self.app.choose_template('no_reply_template'),pools['no_reply_template'][4])
+            self.assertEqual(self.app.choose_template('yes_demo_template'),pools['yes_demo_template'][4])
     def test_sheet_and_implicit_send_choose_per_recipient_and_personalize(self):
         pools=self.store();sender=self.sender()
         with patch.object(self.app.secrets,'choice',side_effect=lambda options:options[-1]):
@@ -55,21 +55,21 @@ class TemplateVariantTests(unittest.TestCase):
         self.assertEqual(sender.sent[0][1],'Reviewed option Person 1')
     def test_automatic_previews_are_validated_then_snapshotted_for_yes_once(self):
         pools=self.store();sender=self.sender();cid=self.contact(999)
-        chosen={key:pools[key][3] for key in ('yes_pitch_template','yes_demo_template','no_reply_template')}
+        chosen={key:pools[key][3] for key in ('yes_pitch_template','yes_demo_template')}
         self.run_async(self.app.send(self.app.Send(id=cid,message='Reviewed initial',auto_yes=True,token_symbol='LF',exchange='okx',auto_reply_templates=chosen)))
         self.store({key:['Changed '+key,'','','',''] for key in pools})
         self.app.record_reply('101','999',1,SimpleNamespace(id=700,date=datetime.now(timezone.utc)+timedelta(seconds=1),raw_text='yes',out=False))
         with patch.object(self.app.secrets,'choice',side_effect=AssertionError('Already selected')):self.run_async(self.app.process_auto_yes());self.run_async(self.app.process_auto_yes())
         self.assertEqual([text for _,text in sender.sent[1:]],['yes_pitch_template option 4 Person 999 $LF OKX','yes_demo_template option 4 Person 999 $LF OKX'])
         self.assertEqual(self.app.usage('101')['dm']['used'],1)
-    def test_automatic_no_uses_its_own_selected_pool(self):
-        pools=self.store();sender=self.sender();cid=self.contact(999)
-        with patch.object(self.app.secrets,'choice',side_effect=lambda options:options[-1]):self.run_async(self.app.deliver(cid,message='Hi',auto_yes=True,token_symbol='LF',exchange='mexc'))
+    def test_automatic_no_does_not_choose_or_send_a_response(self):
+        self.store();sender=self.sender();cid=self.contact(999)
+        self.run_async(self.app.deliver(cid,message='Hi',auto_yes=True,token_symbol='LF',exchange='mexc'))
         self.app.record_reply('101','999',1,SimpleNamespace(id=700,date=datetime.now(timezone.utc)+timedelta(seconds=1),raw_text='no',out=False));self.run_async(self.app.process_auto_yes())
-        self.assertEqual(sender.sent[-1][1],'no_reply_template option 5 Person 999 $LF MEXC');self.assertEqual(len(sender.sent),2)
+        self.assertEqual(len(sender.sent),1);self.assertNotIn('no_reply_template',self.app.settings()['template_variants'])
     def test_stale_or_unlisted_automatic_preview_cannot_send(self):
         self.store();sender=self.sender();cid=self.contact(1)
-        bad={key:'Unexpected text' for key in ('yes_pitch_template','yes_demo_template','no_reply_template')}
+        bad={key:'Unexpected text' for key in ('yes_pitch_template','yes_demo_template')}
         with self.assertRaises(HTTPException) as caught:self.run_async(self.app.send(self.app.Send(id=cid,message='Hi',auto_yes=True,token_symbol='LF',exchange='okx',auto_reply_templates=bad)))
         self.assertEqual(caught.exception.status_code,409);self.assertEqual(sender.sent,[]);self.assertEqual(self.app.records(),[])
     def test_auto_followup_selection_is_saved_before_cooldown_and_kept_for_retry(self):

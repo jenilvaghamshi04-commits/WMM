@@ -29,7 +29,7 @@
     }).sort((a,b)=>time(b.latest?.at)-time(a.latest?.at)||a.key.localeCompare(b.key));
   }
   function filter(threads,search='',account='all'){
-    const q=String(search).trim().toLocaleLowerCase();return threads.filter(t=>(account==='all'||String(t.account_id)===String(account))&&(!q||[t.lead.name,t.lead.username,t.lead.group,t.sender_label,...t.messages.map(m=>m.body)].join(' ').toLocaleLowerCase().includes(q)));
+    const q=String(search).trim().toLocaleLowerCase();return threads.filter(t=>(account==='all'||String(t.account_id)===String(account))&&(!q||[t.lead.name,t.lead.username,t.lead.group,t.lead.location?.country_name,t.lead.location?.timezone,t.sender_label,...t.messages.map(m=>m.body)].join(' ').toLocaleLowerCase().includes(q)));
   }
   root.WMMInboxModel={conversations,filter};
 })(typeof window==='undefined'?globalThis:window);
