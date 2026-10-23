@@ -248,4 +248,15 @@ New workspaces show one account. Add account reveals the next slot, up to the ex
 
 The dashboard navigation no longer includes Replies, Account health or Activity log. Previously saved routes to those pages return to Saved data. Their records, reply detection, follow-up stopping rules, account pauses, and original-sender checks are preserved. Contacts and conversation actions remain available in Saved data, Sent messages and Lead pipeline.
 
-TG Groups admins includes a collapsible Demo format preview with two fictional communities and six sample admins. It uses the same columns as real scans, including missing username/title examples. Demo rows are browser-only, separate from saved-group counts, contacts, imports and messaging, and never written to the gateway database.
+The fictional demo groups and admin rows have been removed from TG Groups admins. This page displays only real saved admin snapshots.
+
+
+## Reviewed admin batches (v3.13)
+
+Real admin rows in TG Groups admins have checkboxes beside the full name. Selecting recipients shows an account selector, 2/5/10-minute delay and Send message. Up to 15 distinct people can be reviewed in one batch. Only real saved admins are eligible, and already-contacted, uncertain or pending recipients cannot be selected for another introduction.
+
+Send message opens a preview dialog with saved shuffled message options or custom text, token and optional exchange personalization. Review each exact message, then Queue messages. Nothing is sent by checking boxes. The authenticated `/groups/admins/send-batch` endpoint validates the whole batch, reserves template rotations and all queue items atomically, and saves an idempotent receipt. A stale template or rejected recipient leaves the entire batch unqueued. Retries with the same request ID return the original receipt.
+
+The reviewed text, original Telegram identity and selected minimum delay persist in SQLite. The worker also enforces the current global delay, quotas, duplicate rules and Telegram pauses. A longer selected delay cannot be shortened by lowering the global setting. If the gateway wakes late, spacing is based on the actual preceding attempt, rather than trying to catch up all messages at once. Pending sends appear on TG Groups admins and can be cancelled there. Closing the browser after queue confirmation does not stop the server queue; the gateway and durable DATA_DIR must remain available. Deploy the latest backend on Render before enabling admin batch sending.
+
+The bulk-selection update also removes the demo preview and all fictional admin seed rows from the dashboard. Existing real saved records are preserved.
