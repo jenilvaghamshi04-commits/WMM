@@ -2,3 +2,5 @@
 @media(max-width:850px){.tg-groups-controls .tg-picker{grid-template-columns:1fr}.tg-group-details{grid-template-columns:1fr;gap:16px}.tg-record-tools{align-items:flex-start;flex-direction:column}.tg-record-tools input{width:100%}.tg-group-heading{padding:20px}.tg-group-details{padding:0 20px 20px}.account-add-row{justify-content:space-between}}
 
 [data-add-account][hidden]{display:none!important}
+
+.tg-demo-panel{margin:0 0 28px}.tg-demo-panel>summary{display:flex;align-items:center;gap:12px;flex-wrap:wrap;cursor:pointer;font-size:14px;font-weight:600;padding:16px 0}.tg-demo-panel>summary::before{content:'▸';color:var(--muted)}.tg-demo-panel[open]>summary::before{content:'▾'}.tg-demo-note{margin:0 0 18px;line-height:1.7}.tg-demo-panel .tg-group-card{border-style:dashed}.tg-demo-panel .tg-group-heading .eyebrow{color:var(--green)}

@@ -247,3 +247,5 @@ New workspaces show one account. Add account reveals the next slot, up to the ex
 
 
 The dashboard navigation no longer includes Replies, Account health or Activity log. Previously saved routes to those pages return to Saved data. Their records, reply detection, follow-up stopping rules, account pauses, and original-sender checks are preserved. Contacts and conversation actions remain available in Saved data, Sent messages and Lead pipeline.
+
+TG Groups admins includes a collapsible Demo format preview with two fictional communities and six sample admins. It uses the same columns as real scans, including missing username/title examples. Demo rows are browser-only, separate from saved-group counts, contacts, imports and messaging, and never written to the gateway database.

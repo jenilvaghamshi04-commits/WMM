@@ -30,6 +30,7 @@ function legacyGroupAdminSnapshots(){
  }
  return [...groups.values()];
 }
+function groupAdminCards(groups,demo=false){return groups.map(g=>`<article class="card tg-group-card"${demo?' data-demo="true"':''}><div class="tg-group-heading"><div><p class="eyebrow">${demo?'DEMO · '+(g.kind==='channel'?'CHANNEL':'GROUP'):(g.kind==='channel'?'CHANNEL':'GROUP')+' · ACCOUNT '+esc(g.account_id)}</p><h2>${esc(g.name)}</h2></div><span class="pill">${demo?'Demo · ':''}${g.admins.length} ${g.admins.length===1?'admin':'admins'}</span></div><dl class="tg-group-details"><div><dt>Group / Channel Name</dt><dd>${esc(g.name)}</dd></div><div><dt>Group Username</dt><dd>${g.username?'@'+esc(g.username):'No public username available'}</dd></div></dl><div class="tablewrap"><table><thead><tr><th>Admin Full Name</th><th>Admin @Username</th><th>User ID</th><th>Role</th><th>Tag / Title (CEO etc)</th><th>Scraped At</th></tr></thead><tbody>${g.admins.length?g.admins.map(a=>`<tr><td><b>${esc(a.name)}</b></td><td>${a.username?'@'+esc(a.username):'<span class="hint">Not available</span>'}</td><td class="tg-user-id">${esc(a.user_id)}</td><td><span class="roletag">${esc(a.role)}</span></td><td>${a.title?esc(a.title):'<span class="hint">No title</span>'}</td><td>${a.scraped_at?esc(new Date(a.scraped_at).toLocaleString()):'Not recorded'}</td></tr>`).join(''):'<tr><td colspan="6" class="tg-empty">No non-bot admin records were visible to this account.</td></tr>'}</tbody></table></div><p class="hint tg-group-footer">${demo?'Sample timestamp':'Saved'} ${g.scraped_at?esc(new Date(g.scraped_at).toLocaleString()):'previously'}${g.legacy?' · Earlier scan':''}</p></article>`).join('')}
 function renderGroupAdmins(){
  const root=document.getElementById('tgGroupRecords');if(!root)return;
  const q=document.getElementById('tgAdminSearch').value.trim().toLowerCase();
@@ -37,7 +38,7 @@ function renderGroupAdmins(){
  const groups=source.slice().sort((a,b)=>(b.scraped_at||'').localeCompare(a.scraped_at||'')).filter(g=>[g.name,g.username,...g.admins.flatMap(a=>[a.name,a.username,a.user_id,a.role,a.title])].join(' ').toLowerCase().includes(q));
  document.getElementById('tgGroupCount').textContent=source.length+' saved '+(source.length===1?'group':'groups');
  document.getElementById('tgGroupGatewayHint').textContent=!live?'Connect your gateway and Telegram account to load joined groups.':!serverFeatures.group_admin_directory?'Deploy the latest gateway on Render to load joined groups. Earlier saved scans are shown below.':'Select one joined group and load its visible admins. Saved results stay available after refresh.';
- root.innerHTML=groups.length?groups.map(g=>`<article class="card tg-group-card"><div class="tg-group-heading"><div><p class="eyebrow">${g.kind==='channel'?'CHANNEL':'GROUP'} · ACCOUNT ${esc(g.account_id)}</p><h2>${esc(g.name)}</h2></div><span class="pill">${g.admins.length} ${g.admins.length===1?'admin':'admins'}</span></div><dl class="tg-group-details"><div><dt>Group / Channel Name</dt><dd>${esc(g.name)}</dd></div><div><dt>Group Username</dt><dd>${g.username?'@'+esc(g.username):'No public username available'}</dd></div></dl><div class="tablewrap"><table><thead><tr><th>Admin Full Name</th><th>Admin @Username</th><th>User ID</th><th>Role</th><th>Tag / Title (CEO etc)</th><th>Scraped At</th></tr></thead><tbody>${g.admins.length?g.admins.map(a=>`<tr><td><b>${esc(a.name)}</b></td><td>${a.username?'@'+esc(a.username):'<span class="hint">Not available</span>'}</td><td class="tg-user-id">${esc(a.user_id)}</td><td><span class="roletag">${esc(a.role)}</span></td><td>${a.title?esc(a.title):'<span class="hint">No title</span>'}</td><td>${a.scraped_at?esc(new Date(a.scraped_at).toLocaleString()):'Not recorded'}</td></tr>`).join(''):'<tr><td colspan="6" class="tg-empty">No non-bot admin records were visible to this account.</td></tr>'}</tbody></table></div><p class="hint tg-group-footer">Saved ${g.scraped_at?esc(new Date(g.scraped_at).toLocaleString()):'previously'}${g.legacy?' · Earlier scan':''}</p></article>`).join(''):'<div class="card tg-empty"><h2>'+ (q?'No matching groups':'No groups saved yet')+'</h2><p class="hint">'+(q?'Try another group, admin name or username.':'Choose an account, load joined groups, then select a group and click Get admins. Existing scans also appear here.')+'</p></div>';
+ root.innerHTML=groups.length?groupAdminCards(groups):'<div class="card tg-empty"><h2>'+ (q?'No matching groups':'No groups saved yet')+'</h2><p class="hint">'+(q?'Try another group, admin name or username.':'Choose an account, load joined groups, then select a group and click Get admins. Existing scans also appear here.')+'</p></div>';
 }
 function resetJoinedGroupPicker(){joinedGroupChoices=[];joinedGroupAccount=null;document.getElementById('tgJoinedGroup').innerHTML='<option value="">Load joined groups first…</option>';document.getElementById('tgJoinedGroup').disabled=true;document.getElementById('getGroupAdmins').disabled=true;document.getElementById('tgGroupsStatus').textContent=''}
 function groupReadReady(){
@@ -48,7 +49,19 @@ function groupReadReady(){
  if(account.blocked_until&&new Date(account.blocked_until)>new Date())throw Error('This account is paused until '+new Date(account.blocked_until).toLocaleString()+'. Saved admin records are still available.');
  return id;
 }
+const demoGroupAdminData=Object.freeze([
+ {name:'Aurora Demo Community',username:'demo_aurora_group',kind:'group',scraped_at:'2026-10-23T10:00:00+00:00',admins:[
+  {name:'Alex Morgan',username:'demo_alex',user_id:'9000001001',role:'Owner',title:'CEO',scraped_at:'2026-10-23T10:00:00+00:00'},
+  {name:'Sam Chen',username:'demo_sam',user_id:'9000001002',role:'Admin',title:'CTO',scraped_at:'2026-10-23T10:00:00+00:00'},
+  {name:'Jordan Lee',username:'demo_jordan',user_id:'9000001003',role:'Admin',title:'Business Development',scraped_at:'2026-10-23T10:00:00+00:00'},
+  {name:'Taylor Reed',username:'',user_id:'9000001004',role:'Admin',title:'Moderator',scraped_at:'2026-10-23T10:00:00+00:00'}]},
+ {name:'Orbit Demo Updates',username:'demo_orbit_updates',kind:'channel',scraped_at:'2026-10-23T09:30:00+00:00',admins:[
+  {name:'Casey Rivera',username:'demo_casey',user_id:'9000002001',role:'Owner',title:'Founder',scraped_at:'2026-10-23T09:30:00+00:00'},
+  {name:'Riley Parker',username:'demo_riley',user_id:'9000002002',role:'Admin',title:'',scraped_at:'2026-10-23T09:30:00+00:00'}]}
+]);
+function renderGroupAdminDemo(){document.getElementById('tgDemoRecords').innerHTML=groupAdminCards(demoGroupAdminData,true)}
 document.addEventListener('DOMContentLoaded',()=>{
+ renderGroupAdminDemo();
  document.getElementById('tgAdminSearch').oninput=renderGroupAdmins;
  document.getElementById('tgGroupAccount').onchange=resetJoinedGroupPicker;
  document.getElementById('tgJoinedGroup').onchange=()=>{document.getElementById('getGroupAdmins').disabled=!document.getElementById('tgJoinedGroup').value};
