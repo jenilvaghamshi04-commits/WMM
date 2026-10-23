@@ -6,7 +6,7 @@ async function showTelegramQrState(result,id){
   if(result.status==='password'){clearTelegramQr();await refresh(false);toast('QR accepted. Enter your Telegram two-step password below.');return}
   if(result.status!=='waiting'){image.removeAttribute('src');image.hidden=true;status.textContent=result.error||'QR code expired. Generate a new QR code.';return}
   if(result.image){image.src=result.image;image.hidden=false}
-  status.textContent='Waiting for approval on your phone · Account '+id+'. Expires '+new Date(result.expires_at).toLocaleTimeString()+'.';
+  status.textContent='Waiting for approval on your phone · Account '+id+'. Expires '+new Date(result.expires_at).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour12:true,timeZoneName:'short'})+'.';
   const cycle=telegramQrGeneration;
   telegramQrTimer=setTimeout(async()=>{
     if(cycle!==telegramQrGeneration||telegramQrSlot!==id||slot()!==id||!live)return;

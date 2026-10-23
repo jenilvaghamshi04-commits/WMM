@@ -1,7 +1,7 @@
 function followupAction(summary,lead){if(!summary.canFollowup||WMMMessageModel.hasReplied(lead))return '';return lead?.followup_due?'<button class="primary" data-due="'+esc(lead.key)+'">Review due follow-up</button>':'<button class="primary" data-followup="'+esc(summary.lastSent.delivery_id)+'">Send follow-up ↗</button>'}
 function crmKey(contact){const kind=contact.kind||'dm';return kind+':'+String(contact.target??(kind==='group'?contact.group_id:contact.user_id))}
 function crmLead(contact){return leads.find(lead=>lead.key===crmKey(contact))}
-function crmDate(value){return value?new Date(value).toLocaleString():'Not checked'}
+function crmDate(value){return value?new Date(value).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true,timeZoneName:'short'}):'Not checked'}
 function leadBadges(lead){
   if(!lead)return '<div class="sentmeta">Lead tracking: deploy the latest gateway.</div>';
   return '<div class="crm-badges"><span class="crm-badge '+(lead.reply_status==='Replied'?'replied':'')+'">'+esc(lead.reply_status)+'</span><span class="crm-badge">Stage: '+esc(lead.stage)+'</span>'+(lead.needs_attention?'<span class="crm-badge attention">Reply needs attention</span>':'')+(lead.followup_due&&!WMMMessageModel.hasReplied(lead)?'<span class="crm-badge attention">Follow-up due</span>':'')+'</div>'+(lead.due_at&&!WMMMessageModel.hasReplied(lead)?'<div class="sentmeta">Follow-up '+(lead.followup_due&&!WMMMessageModel.hasReplied(lead)?'due ':'scheduled ')+esc(crmDate(lead.due_at))+'</div>':'')+(lead.latest_reply?'<div class="crm-snippet">'+esc(lead.latest_reply.body.slice(0,130))+'</div>':'')+(lead.sync_error?'<div class="deliverydetail">'+esc(lead.sync_error)+'</div>':'')+folderBadges(lead)+autoReplyBadges(lead)+autoFollowupBadges(lead);

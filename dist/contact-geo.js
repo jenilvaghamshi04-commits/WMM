@@ -1,5 +1,5 @@
 let countryOptions=null,locationContactId=null;
-function localDate(at,zone){if(!at)return 'Not scheduled';try{return new Date(at).toLocaleString(undefined,{timeZone:zone||undefined,dateStyle:'medium',timeStyle:'short'})+(zone?' · '+zone:'')}catch{return 'Choose a timezone'}}
+function localDate(at,zone){if(!at)return 'Not scheduled';try{return new Date(at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',dateStyle:'medium',timeStyle:'short'})+' IST'}catch{return 'Choose a timezone'}}
 function countryBadge(location){
   const l=location||{},known=!!l.country_code,source=l.country_source||'Unknown';
   const label=known?l.country_name:'Country unknown';

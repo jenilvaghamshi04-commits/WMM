@@ -278,3 +278,17 @@ TG Groups admins includes Add new group data. It opens the account selector and 
 Only a successful, committed, non-empty admin snapshot queues Telegram Archive (folder 1). Both automatic collections and the new picker use this rule. The archive job is durable, tied to the original identity and group, honors Telegram pauses, and retries interrupted attempts at 15-minute intervals up to three failures. Archive failures never remove saved admin data. Empty or hidden admin lists do not archive a group. The saved card shows Archived, Archive pending, or an explicit failure/skip explanation. Archiving retains Telegram membership and does not send messages. Old v3.14 snapshots are not automatically archived retroactively.
 
 Authenticated POST /groups/new lists eligible groups, and POST /groups/new/admins collects one with the returned watch_principal identity. Repeat collection requests return the saved data without another admin read or duplicate archive. The worker can finish an archive while the browser is closed, provided the backend and its DATA_DIR remain available. Deploy gateway v3.15 on Render to enable the button.
+
+
+## Group dropdowns and visible message delay
+
+TG Groups admins presents each saved group as a native, keyboard-accessible dropdown. Its group name, account and admin count stay visible; expanding a group shows only its own details and closes the other group. The newest group opens first. Checkbox changes and data refreshes retain the expanded group. Existing records and selections remain intact.
+
+An always-visible Message delay selector on the same page edits the existing global 2/5/10-minute sending minimum through /sending-pace. Save delay persists the setting and refreshes the display; this is the same setting as Connections. A longer minimum already saved with a queued batch remains enforced. No backend change is required for this presentation update.
+
+
+## IST and sending directly from TG Groups admins
+
+The editable Message delay card is at the top of TG Groups admins. Each group keeps its own collapsible name/account heading. Selecting admins opens an inline composer on this same page, with token, exchange and saved message option fields. Custom text entry is omitted from this composer. Choose Random saved options for a shuffled cycle, or a specific available option; for multiple recipients that chosen option goes first and the remaining recipients continue the nonrepeating cycle. Used options are unavailable until their current cycle finishes. Token and exchange are required for this flow. Review exact personalized previews before sending; pending send status and cancellation stay on the page.
+
+Dashboard timestamps, queued-send times, QR expiry, account waits, logs and history explicitly use Asia/Kolkata and display IST, regardless of the browser's timezone. Country-based follow-up schedule calculations retain the recipient's timezone; their displayed due dates are converted to IST. Stored UTC timestamps, original-sender rules, account pauses, daily limits, delayed queues and existing data are unchanged. This update uses the existing backend endpoints.

@@ -20,7 +20,7 @@ async function pingWhileVisible(force=false){
     if(response.status===404)response=await fetch(url.replace(/\/api\/health$/,'/health'),options);
     const data=await response.json();
     if(!response.ok||data.ok!==true||data.service!=='teamradar')throw Error('Health check unavailable');
-    heartbeatStatus('Browser heartbeat active · checked '+new Date().toLocaleTimeString()+'. Next check in 10 minutes while this page is visible.');
+    heartbeatStatus('Browser heartbeat active · checked '+new Date().toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour12:true,timeZoneName:'short'})+'. Next check in 10 minutes while this page is visible.');
   }catch{heartbeatStatus('Server is waking up or unavailable. The next browser heartbeat will try again; you can also use Check server now.');}
   finally{clearTimeout(timeout);if(activeHeartbeatController===controller)activeHeartbeatController=null}
 }
@@ -42,7 +42,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     const value=document.querySelector('#serverHealthUrl').value;if(!value)throw Error('Connect your gateway first.');
     const result=document.querySelector('#serverHealthResult'),controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),90000);
     result.textContent='Checking the server… A sleeping Render service can take a minute to wake up.';
-    try{const response=await fetch(value,{cache:'no-store',signal:controller.signal}),data=await response.json();if(!response.ok||data.ok!==true||data.service!=='teamradar')throw Error('This URL did not return a healthy WMM server response.');result.textContent='Server is responding · checked '+new Date().toLocaleString()+'. Configure the external schedule with this server URL to keep checking every 10 minutes.';toast('WMM server is responding.')}catch(error){result.textContent=error.name==='AbortError'?'The server is still waking up or unavailable. Try the health check again shortly.':'Could not verify the WMM health endpoint. Check your Render service and gateway URL.';throw error}finally{clearTimeout(timeout)}
+    try{const response=await fetch(value,{cache:'no-store',signal:controller.signal}),data=await response.json();if(!response.ok||data.ok!==true||data.service!=='teamradar')throw Error('This URL did not return a healthy WMM server response.');result.textContent='Server is responding · checked '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true,timeZoneName:'short'})+'. Configure the external schedule with this server URL to keep checking every 10 minutes.';toast('WMM server is responding.')}catch(error){result.textContent=error.name==='AbortError'?'The server is still waking up or unavailable. Try the health check again shortly.':'Could not verify the WMM health endpoint. Check your Render service and gateway URL.';throw error}finally{clearTimeout(timeout)}
   });
   document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')void pingWhileVisible(true);else heartbeatStatus('Browser heartbeat paused while this page is hidden. It resumes when you return.');});
   window.addEventListener('pagehide',stopVisibleHeartbeat);
