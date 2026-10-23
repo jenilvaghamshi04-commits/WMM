@@ -38,3 +38,13 @@ class KeepAliveTests(unittest.TestCase):
         try:
             response=case.run_async(case.app.health());self.assertIn('no-store',response.headers['cache-control']);data=json.loads(response.body);self.assertEqual(data['service'],'teamradar');self.assertTrue(data['ok']);self.assertNotIn('api_hash',data);self.assertNotIn('contacts',data)
         finally:case.tearDown()
+
+    def test_browser_health_alias_has_public_uncached_response(self):
+        import test_gateway as gateway_tests
+        from fastapi.testclient import TestClient
+        case=gateway_tests.GatewayTests();case.setUp()
+        try:
+            client=TestClient(case.app.app)
+            for path in ['/health','/api/health']:
+                response=client.get(path);self.assertEqual(response.status_code,200);data=response.json();self.assertTrue(data['ok']);self.assertGreater(data['time'],0);self.assertIn('no-store',response.headers['cache-control']);self.assertNotIn('contacts',data)
+        finally:case.tearDown()
