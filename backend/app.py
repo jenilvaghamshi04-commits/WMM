@@ -1,4 +1,6 @@
-import os,json,sqlite3,asyncio,secrets,re,hashlib,uuid,copy,math
+import os,json,sqlite3,asyncio,secrets,re,hashlib,uuid,copy,math,io,base64
+import qrcode
+import qrcode.image.svg
 from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -15,9 +17,9 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.9')
+app=FastAPI(title='WMM Team',version='3.10')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
-lock=asyncio.Lock();login_pending={};clients={};startup_errors={};reply_task=None;geo_task=None;geo_lock=asyncio.Lock();folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
+lock=asyncio.Lock();login_pending={};qr_logins={};clients={};startup_errors={};reply_task=None;geo_task=None;geo_lock=asyncio.Lock();folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
 db.execute('create table if not exists location_profiles(key text primary key,data text)')
 db.execute('create table if not exists country_lookup_queue(key text primary key,contact_id text,slot integer,principal text,next_attempt_at text,last_checked_at text,error text)')
@@ -831,6 +833,11 @@ async def start():
     auto_followup_task=asyncio.create_task(auto_followup_loop())
 @app.on_event('shutdown')
 async def stop():
+    qr_tasks=[state.get('task') for state in list(qr_logins.values()) if state.get('task')]
+    for slot in list(qr_logins):cancel_qr_login(slot)
+    for task in qr_tasks:
+        try:await task
+        except asyncio.CancelledError:pass
     for task in (reply_task,folder_task,auto_yes_task,auto_followup_task,geo_task):
         if task:
             task.cancel()
@@ -873,7 +880,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.9'},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.10'},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -881,6 +888,7 @@ async def configure_telegram_api(body:TelegramAPI):
     async with lock:
         old=clients.get(slot)
         if old and old.is_connected() and await old.is_user_authorized():raise HTTPException(409,'Disconnect this Telegram account before replacing its API credentials')
+        cancel_qr_login(slot)
         if old:await old.disconnect()
         candidate=TelegramClient(session_path(slot),body.api_id,value,flood_sleep_threshold=0)
         try:await candidate.connect()
@@ -907,7 +915,7 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
-    return {'version':'3.9','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True}}
+    return {'version':'3.10','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':settings(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
 WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue')
 def workspace_reset_counts():
@@ -961,7 +969,8 @@ def normalize_login_phone(phone):
 def login_progress(slot):
     state=login_pending.get(slot)
     if state and state['expires_at']<=stamp():login_pending.pop(slot,None);state=None
-    return {'login_step':('password' if state['password_required'] else 'code') if state else 'phone','login_phone_hint':('••••'+state['phone'][-4:]) if state else ''}
+    qr=qr_logins.get(slot)
+    return {'login_step':('password' if state['password_required'] else 'code') if state else ('qr' if qr and qr['status']=='waiting' else 'phone'),'login_phone_hint':('••••'+state['phone'][-4:]) if state and state.get('phone') else ''}
 async def renew_login_client(slot,old):
     # Reset only a rejected Telegram transport key for this slot; retain app records and API settings.
     await old.disconnect()
@@ -971,6 +980,72 @@ async def renew_login_client(slot,old):
     replacement=make_client(slot)
     if replacement is None:raise HTTPException(409,'Configure the Telegram API for this account first.')
     clients[slot]=replacement;await replacement.connect();return replacement
+def cancel_qr_login(slot):
+    state=qr_logins.pop(slot,None)
+    if state and state.get('task') and not state['task'].done():state['task'].cancel()
+    pending=login_pending.get(slot)
+    if pending and pending.get('method')=='qr':login_pending.pop(slot,None)
+
+def qr_login_result(slot,state,include_image=False):
+    result={'account_id':slot,'status':state['status'],'expires_at':state['expires_at'],'error':state.get('error','')}
+    if include_image and state['status']=='waiting':result['image']=state['image']
+    return result
+
+async def finish_qr_login(slot,client,qr,state):
+    try:
+        await qr.wait()
+        async with lock:
+            if qr_logins.get(slot) is not state or clients.get(slot) is not client:return
+            try:await identify(slot,client)
+            except HTTPException as error:
+                await client.log_out();state['status']='error';state['error']=error.detail;return
+            login_pending.pop(slot,None);state['status']='authorized';state.pop('image',None)
+    except errors.SessionPasswordNeededError:
+        async with lock:
+            if qr_logins.get(slot) is not state or clients.get(slot) is not client:return
+            login_pending[slot]={'method':'qr','phone':'','password_required':True,'expires_at':(datetime.now(timezone.utc)+timedelta(minutes=10)).isoformat()}
+            state['status']='password';state.pop('image',None)
+    except asyncio.TimeoutError:
+        if qr_logins.get(slot) is state:state.update(status='expired',error='QR code expired. Generate a new QR code.');state.pop('image',None)
+    except asyncio.CancelledError:raise
+    except Exception:
+        if qr_logins.get(slot) is state:state.update(status='error',error='Telegram could not complete QR login. Generate a new QR code, or try again later.');state.pop('image',None)
+
+@app.post('/login/qr',dependencies=[Depends(auth)])
+async def start_qr_login(body:Account):
+    async with lock:
+        slot=body.account_id;client=require_client(slot)
+        if not client.is_connected():await client.connect()
+        if await client.is_user_authorized():
+            await identify(slot,client);return {'account_id':slot,'status':'authorized'}
+        previous=qr_logins.get(slot)
+        if previous and previous['status']=='waiting' and previous['expires_at']>stamp():return qr_login_result(slot,previous,True)
+        if previous and previous['status']=='password' and login_progress(slot)['login_step']=='password':return qr_login_result(slot,previous)
+        cancel_qr_login(slot)
+        login_pending.pop(slot,None)
+        try:qr=await client.qr_login()
+        except LOGIN_AUTH_ERRORS:
+            client=await renew_login_client(slot,client);qr=await client.qr_login()
+        svg=qrcode.make(qr.url,image_factory=qrcode.image.svg.SvgPathImage,box_size=8,border=4)
+        output=io.BytesIO();svg.save(output)
+        state={'status':'waiting','expires_at':qr.expires.isoformat(),'image':'data:image/svg+xml;base64,'+base64.b64encode(output.getvalue()).decode()}
+        qr_logins[slot]=state;state['task']=asyncio.create_task(finish_qr_login(slot,client,qr,state))
+        # Register Telethon's token listener before returning an image that can be scanned.
+        await asyncio.sleep(0)
+        return qr_login_result(slot,state,True)
+
+@app.post('/login/qr/status',dependencies=[Depends(auth)])
+async def check_qr_login(body:Account):
+    state=qr_logins.get(body.account_id)
+    if not state:return {'account_id':body.account_id,'status':'expired','error':'Generate a new QR code to start login.'}
+    if state['status']=='password' and login_progress(body.account_id)['login_step']!='password':state.update(status='expired',error='Password login expired. Generate a new QR code.')
+    return qr_login_result(body.account_id,state)
+
+@app.post('/login/qr/cancel',dependencies=[Depends(auth)])
+async def stop_qr_login(body:Account):
+    async with lock:cancel_qr_login(body.account_id)
+    return {'ok':True}
+
 @app.post('/login',dependencies=[Depends(auth)])
 async def login(body:Login):
     phone=normalize_login_phone(body.phone)
@@ -981,6 +1056,7 @@ async def login(body:Login):
             await identify(body.account_id,c);login_pending.pop(body.account_id,None)
             return {'authorized':True,'account_id':body.account_id}
         login_progress(body.account_id)
+        if qr_logins.get(body.account_id,{}).get('status')=='waiting':raise HTTPException(409,'Scan the pending QR code or cancel QR login before requesting a phone code.')
         pending=login_pending.get(body.account_id)
         if pending and pending['phone']==phone:
             return {'ok':True,'account_id':body.account_id,'login_step':'password' if pending['password_required'] else 'code','existing_code':True}
@@ -1023,7 +1099,7 @@ async def verify(body:Verify):
             return {'authorized':True,'account_id':body.account_id}
         login_progress(body.account_id);state=login_pending.get(body.account_id)
         if not state:raise HTTPException(409,'Request a new login code for this account first. Pending logins expire after a restart or timeout.')
-        if body.phone and normalize_login_phone(body.phone)!=state['phone']:raise HTTPException(409,'This login code belongs to another phone number. Request a new code for the number shown.')
+        if state.get('method')!='qr' and body.phone and normalize_login_phone(body.phone)!=state['phone']:raise HTTPException(409,'This login code belongs to another phone number. Request a new code for the number shown.')
         try:
             if not state['password_required']:
                 code=re.sub(r'[\s-]','',body.code)
@@ -1042,12 +1118,12 @@ async def verify(body:Verify):
         try:await identify(body.account_id,c)
         except HTTPException:
             login_pending.pop(body.account_id,None);await c.log_out();raise
-        login_pending.pop(body.account_id,None)
+        login_pending.pop(body.account_id,None);cancel_qr_login(body.account_id)
     return {'authorized':True,'account_id':body.account_id}
 @app.post('/logout',dependencies=[Depends(auth)])
 async def logout(body:Account):
     async with lock:
-        c=require_client(body.account_id);login_pending.pop(body.account_id,None);await c.log_out()
+        c=require_client(body.account_id);cancel_qr_login(body.account_id);login_pending.pop(body.account_id,None);await c.log_out()
         clients.pop(body.account_id,None)
         replacement=make_client(body.account_id)
         if replacement:clients[body.account_id]=replacement;await replacement.connect()
