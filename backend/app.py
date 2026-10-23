@@ -980,11 +980,34 @@ async def login(body:Login):
         if await c.is_user_authorized():
             await identify(body.account_id,c);login_pending.pop(body.account_id,None)
             return {'authorized':True,'account_id':body.account_id}
-        login_pending.pop(body.account_id,None)
+        login_progress(body.account_id)
+        pending=login_pending.get(body.account_id)
+        if pending and pending['phone']==phone:
+            return {'ok':True,'account_id':body.account_id,'login_step':'password' if pending['password_required'] else 'code','existing_code':True}
+        if pending:raise HTTPException(409,'Finish the pending login for this account, or wait for it to expire before using another phone number.')
+        wait_key='login_code_wait:'+hashlib.sha256(phone.encode()).hexdigest()
+        wait=db.execute('select value from meta where key=?',(wait_key,)).fetchone()
+        if wait and wait[0]>stamp():
+            seconds=max(1,math.ceil((datetime.fromisoformat(wait[0])-datetime.now(timezone.utc)).total_seconds()))
+            raise HTTPException(429,'Login code requests are paused. Try again after '+str(seconds)+' seconds. Check Telegram’s service chat for a code already delivered.',headers={'Retry-After':str(seconds)})
+        def clear_stale_code(client):
+            # Telethon interprets a cached hash as an implicit resend. There is no live
+            # pending login here, so start a fresh sendCode rather than exhausting media.
+            cache=getattr(client,'_phone_code_hash',None)
+            if cache is not None:cache.pop(utils.parse_phone(phone),None)
         try:
+            clear_stale_code(c)
             try:r=await c.send_code_request(phone)
             except LOGIN_AUTH_ERRORS:
-                c=await renew_login_client(body.account_id,c);r=await c.send_code_request(phone)
+                c=await renew_login_client(body.account_id,c);clear_stale_code(c);r=await c.send_code_request(phone)
+        except errors.SendCodeUnavailableError:
+            until=(datetime.now(timezone.utc)+timedelta(minutes=15)).isoformat()
+            db.execute('insert or replace into meta values(?,?)',(wait_key,until));db.commit()
+            raise HTTPException(429,'Telegram cannot deliver another login code right now. Check Telegram’s service chat for an existing code. This app will pause new code requests for 15 minutes; Telegram may require a longer wait. Do not repeatedly request codes.',headers={'Retry-After':'900'})
+        except errors.FloodWaitError as error:
+            seconds=max(1,error.seconds);until=(datetime.now(timezone.utc)+timedelta(seconds=seconds)).isoformat()
+            db.execute('insert or replace into meta values(?,?)',(wait_key,until));db.commit()
+            raise HTTPException(429,'Telegram requires a wait of '+str(seconds)+' seconds before another login code request.',headers={'Retry-After':str(seconds)})
         except LOGIN_AUTH_ERRORS:raise HTTPException(409,'Telegram could not start this login. Request a new code for this account again.')
         except errors.PhoneNumberInvalidError:raise HTTPException(400,'Telegram rejected this phone number. Check the +country code and number.')
         if not getattr(r,'phone_code_hash',None):raise HTTPException(409,'Telegram did not start a code login. Request a new login code.')

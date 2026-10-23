@@ -7,7 +7,7 @@ from telethon import errors
 from test_gateway import FakeClient
 
 class LoginClient(FakeClient):
-    def __init__(self,user=101,two_step=True):super().__init__(user=user,authorized=False);self.two_step=two_step;self.code_accepted=False;self.steps=[];self.password_error=None;self.code_error=None;self.request_error=None;self.codes_requested=0
+    def __init__(self,user=101,two_step=True):super().__init__(user=user,authorized=False);self.two_step=two_step;self.code_accepted=False;self.steps=[];self.password_error=None;self.code_error=None;self.request_error=None;self.codes_requested=0;self._phone_code_hash={}
     async def send_code_request(self,phone):
         self.codes_requested+=1
         if self.request_error:raise self.request_error
@@ -71,11 +71,39 @@ class TelegramLoginTests(unittest.TestCase):
         with self.assertRaises(HTTPException):self.verify(account_id=2,password='correct-password')
         with self.assertRaises(HTTPException):self.verify(phone='+441234567890',code='12345')
         self.assertEqual(self.client.steps,[]);self.assertEqual(self.app.clients[2].steps,[])
-    def test_new_code_starts_code_step_and_phone_format_is_normalized(self):
-        self.request();self.verify(code='12345');self.request(phone='+91 98765-43210');self.assertEqual(self.app.login_progress(1)['login_step'],'code');self.assertEqual(self.app.login_pending[1]['phone'],'+919876543210');self.assertEqual(self.app.login_progress(1)['login_phone_hint'],'••••3210')
+    def test_repeated_request_preserves_password_step_and_normalizes_phone(self):
+        self.request();self.verify(code='12345');r=self.request(phone='+91 98765-43210');self.assertTrue(r['existing_code']);self.assertEqual(self.client.codes_requested,1);self.assertEqual(self.app.login_progress(1)['login_step'],'password');self.assertEqual(self.app.login_pending[1]['phone'],'+919876543210');self.assertEqual(self.app.login_progress(1)['login_phone_hint'],'••••3210')
     def test_valid_connected_account_does_not_request_new_code(self):
         self.client.authorized=True;self.assertTrue(self.request()['authorized']);self.assertEqual(self.client.codes_requested,0)
     def test_rejected_transport_key_is_renewed_only_in_selected_slot(self):
         self.client.request_error=errors.AuthKeyUnregisteredError(request=None);session=SimpleNamespace(auth_key='rejected',save=lambda:None,close=lambda:None);self.client.session=session;replacement=LoginClient();other=LoginClient(user=102);self.app.clients[2]=other
         with patch.object(self.app,'make_client',return_value=replacement):self.request()
         self.assertIsNone(session.auth_key);self.assertIs(self.app.clients[1],replacement);self.assertIs(self.app.clients[2],other);self.assertEqual(replacement.codes_requested,1);self.assertEqual(other.codes_requested,0)
+
+    def test_repeated_request_preserves_code_without_resending(self):
+        self.request();state=dict(self.app.login_pending[1]);r=self.request()
+        self.assertTrue(r['existing_code']);self.assertEqual(self.client.codes_requested,1);self.assertEqual(self.app.login_pending[1],state)
+    def test_stale_telethon_hash_is_cleared_for_fresh_login(self):
+        self.client._phone_code_hash={'919876543210':'stale','441234567890':'other'}
+        self.request();self.assertNotIn('919876543210',self.client._phone_code_hash);self.assertEqual(self.client._phone_code_hash['441234567890'],'other')
+    def test_unavailable_delivery_is_friendly_and_pauses_requests_across_slots(self):
+        self.client.request_error=errors.SendCodeUnavailableError(request=None)
+        with self.assertRaises(HTTPException) as e:self.request()
+        self.assertEqual(e.exception.status_code,429);self.assertEqual(e.exception.headers['Retry-After'],'900');self.assertIn('Telegram cannot deliver',e.exception.detail);self.assertNotIn(1,self.app.login_pending)
+        self.app.clients[2]=LoginClient(user=102)
+        with self.assertRaises(HTTPException):self.request(slot=2)
+        self.assertEqual(self.app.clients[2].codes_requested,0)
+        self.app.db.close();self.load();self.app.clients[1]=self.client
+        with self.assertRaises(HTTPException):self.request()
+        self.assertEqual(self.client.codes_requested,1)
+    def test_telegram_flood_wait_is_preserved(self):
+        self.client.request_error=errors.FloodWaitError(request=None,capture=120)
+        with self.assertRaises(HTTPException) as e:self.request()
+        self.assertEqual(e.exception.headers['Retry-After'],'120')
+        self.client.request_error=None
+        with self.assertRaises(HTTPException):self.request()
+        self.assertEqual(self.client.codes_requested,1)
+    def test_other_phone_cannot_replace_active_login(self):
+        self.request()
+        with self.assertRaises(HTTPException):self.request(phone='+441234567890')
+        self.assertEqual(self.client.codes_requested,1);self.assertEqual(self.app.login_pending[1]['phone'],'+919876543210')
