@@ -1,5 +1,5 @@
 /* Joined groups, saved admin snapshots, and progressive account setup. */
-let groupAdminSnapshots=[],joinedGroupChoices=[],joinedGroupAccount=null,accountSlotCount=1;
+let groupAdminSnapshots=[],joinedGroupChoices=[],joinedGroupAccount=null,joinedGroupPrincipal=null,accountSlotCount=1;
 function visibleAccounts(){return accounts.filter(a=>a.id<=accountSlotCount||a.authorized||a.api_configured)}
 function renderAccountSelectors(){
  const visible=visibleAccounts();
@@ -30,7 +30,7 @@ function legacyGroupAdminSnapshots(){
  }
  return [...groups.values()];
 }
-function groupAdminCards(groups,demo=false){return groups.map(g=>`<article class="card tg-group-card"${demo?' data-demo="true"':''}><div class="tg-group-heading"><div><p class="eyebrow">${demo?'DEMO · '+(g.kind==='channel'?'CHANNEL':'GROUP'):(g.kind==='channel'?'CHANNEL':'GROUP')+' · ACCOUNT '+esc(g.account_id)}</p><h2>${esc(g.name)}</h2></div><span class="pill">${demo?'Demo · ':''}${g.admins.length} ${g.admins.length===1?'admin':'admins'}</span></div><dl class="tg-group-details"><div><dt>Group / Channel Name</dt><dd>${esc(g.name)}</dd></div><div><dt>Group Username</dt><dd>${g.username?'@'+esc(g.username):'No public username available'}</dd></div></dl><div class="tablewrap"><table><thead><tr><th>Admin Full Name</th><th>Admin @Username</th><th>User ID</th><th>Role</th><th>Tag / Title (CEO etc)</th><th>Scraped At</th></tr></thead><tbody>${g.admins.length?g.admins.map(a=>`<tr><td>${adminBatchCheckbox(a,g,demo)}</td><td>${a.username?'@'+esc(a.username):'<span class="hint">Not available</span>'}</td><td class="tg-user-id">${esc(a.user_id)}</td><td><span class="roletag">${esc(a.role)}</span></td><td>${a.title?esc(a.title):'<span class="hint">No title</span>'}</td><td>${a.scraped_at?esc(new Date(a.scraped_at).toLocaleString()):'Not recorded'}</td></tr>`).join(''):'<tr><td colspan="6" class="tg-empty">No non-bot admin records were visible to this account.</td></tr>'}</tbody></table></div><p class="hint tg-group-footer">${demo?'Sample timestamp':'Saved'} ${g.scraped_at?esc(new Date(g.scraped_at).toLocaleString()):'previously'}${g.legacy?' · Earlier scan':''}</p></article>`).join('')}
+function groupAdminCards(groups,demo=false){return groups.map(g=>`<article class="card tg-group-card"${demo?' data-demo="true"':''}><div class="tg-group-heading"><div><p class="eyebrow">${demo?'DEMO · '+(g.kind==='channel'?'CHANNEL':'GROUP'):(g.kind==='channel'?'CHANNEL':'GROUP')+' · ACCOUNT '+esc(g.account_id)}</p><h2>${esc(g.name)}</h2></div><span class="pill">${demo?'Demo · ':''}${g.admins.length} ${g.admins.length===1?'admin':'admins'}</span></div><dl class="tg-group-details"><div><dt>Group / Channel Name</dt><dd>${esc(g.name)}</dd></div><div><dt>Group Username</dt><dd>${g.username?'@'+esc(g.username):'No public username available'}</dd></div></dl><div class="tablewrap"><table><thead><tr><th>Admin Full Name</th><th>Admin @Username</th><th>User ID</th><th>Role</th><th>Tag / Title (CEO etc)</th><th>Scraped At</th></tr></thead><tbody>${g.admins.length?g.admins.map(a=>`<tr><td>${adminBatchCheckbox(a,g,demo)}</td><td>${a.username?'@'+esc(a.username):'<span class="hint">Not available</span>'}</td><td class="tg-user-id">${esc(a.user_id)}</td><td><span class="roletag">${esc(a.role)}</span></td><td>${a.title?esc(a.title):'<span class="hint">No title</span>'}</td><td>${a.scraped_at?esc(new Date(a.scraped_at).toLocaleString()):'Not recorded'}</td></tr>`).join(''):'<tr><td colspan="6" class="tg-empty">No non-bot admin records were visible to this account.</td></tr>'}</tbody></table></div><p class="hint tg-group-footer">${demo?'Sample timestamp':'Saved'} ${g.scraped_at?esc(new Date(g.scraped_at).toLocaleString()):'previously'}${g.legacy?' · Earlier scan':''}${g.archive?' · '+esc(groupArchiveLabel(g.archive)):''}</p></article>`).join('')}
 function newGroupAdminSnapshots(){return groupAdminSnapshots.filter(g=>g.collection_source==='automatic_join')}
 function renderGroupWatch(){
  const root=document.getElementById('tgWatchAccounts');if(!root)return;
@@ -47,7 +47,7 @@ function renderGroupAdmins(){
  document.getElementById('tgGroupGatewayHint').textContent=!live?'Connect your gateway and Telegram account to start watching new groups.':!serverFeatures.new_group_watch?'Deploy gateway v3.14 on Render to enable automatic collection.':'Checks run every 5 minutes while the gateway is running. New groups are read one at a time, at least 2 minutes apart. Refresh saved data to see the latest results.';
  root.innerHTML=groups.length?groupAdminCards(groups):'<div class="card tg-empty"><h2>'+ (q?'No matching new groups':'Waiting for your next group')+'</h2><p class="hint">'+(q?'Try another group, admin name or username.':'After monitoring starts, join a new group in Telegram. Its visible admins and titles will appear here automatically. Earlier groups are excluded.')+'</p></div>';
 }
-function resetJoinedGroupPicker(){joinedGroupChoices=[];joinedGroupAccount=null;document.getElementById('tgJoinedGroup').innerHTML='<option value="">Load joined groups first…</option>';document.getElementById('tgJoinedGroup').disabled=true;document.getElementById('getGroupAdmins').disabled=true;document.getElementById('tgGroupsStatus').textContent=''}
+function resetJoinedGroupPicker(){joinedGroupChoices=[];joinedGroupAccount=null;joinedGroupPrincipal=null;document.getElementById('tgJoinedGroup').innerHTML='<option value="">Load new groups first…</option>';document.getElementById('tgJoinedGroup').disabled=true;document.getElementById('getGroupAdmins').disabled=true;document.getElementById('tgGroupsStatus').textContent=''}
 function groupReadReady(){
  if(!live)throw Error('Connect your gateway first.');
  if(!serverFeatures.group_admin_directory)throw Error('Deploy the latest gateway on Render to use joined groups.');
@@ -59,22 +59,28 @@ function groupReadReady(){
 document.addEventListener('DOMContentLoaded',()=>{
  initializeAdminBatch();
  document.getElementById('tgAdminSearch').oninput=renderGroupAdmins;
- document.getElementById('tgGroupAccount').onchange=resetJoinedGroupPicker;
+ document.getElementById('tgGroupAccount').onchange=()=>{resetJoinedGroupPicker();document.getElementById('tgGroupsStatus').textContent='Click Refresh new groups for the selected account.'};
+ document.getElementById('addNewGroupData').onclick=()=>action(document.getElementById('addNewGroupData'),async()=>{document.getElementById('tgNewGroupPicker').hidden=false;await loadNewJoinedGroups()});
  document.getElementById('tgJoinedGroup').onchange=()=>{document.getElementById('getGroupAdmins').disabled=!document.getElementById('tgJoinedGroup').value};
- document.getElementById('loadJoinedGroups').onclick=()=>action(document.getElementById('loadJoinedGroups'),async()=>{
-  const id=groupReadReady();document.getElementById('tgGroupsStatus').textContent='Loading joined groups for Account '+id+'…';
-  try{const result=await api('/groups/joined',{account_id:id});joinedGroupChoices=result.groups;joinedGroupAccount=id;
-   const node=document.getElementById('tgJoinedGroup');node.innerHTML='<option value="">Choose a joined group…</option>'+joinedGroupChoices.map(g=>`<option value="${esc(g.group_id)}">${esc(g.name)}${g.username?' · @'+esc(g.username):''}</option>`).join('');node.disabled=!joinedGroupChoices.length;document.getElementById('getGroupAdmins').disabled=true;
-   document.getElementById('tgGroupsStatus').textContent=joinedGroupChoices.length+' joined groups / channels available.'+(result.cached?' Using the recent list (cached for 10 minutes).':'')+(result.truncated?' Only the first 1,000 chats were checked; use Find team for another joined group.':'');
-  }catch(error){document.getElementById('tgGroupsStatus').textContent=error.message;throw error}
- });
+ document.getElementById('loadJoinedGroups').onclick=()=>action(document.getElementById('loadJoinedGroups'),loadNewJoinedGroups);
  document.getElementById('getGroupAdmins').onclick=()=>action(document.getElementById('getGroupAdmins'),async()=>{
   const id=groupReadReady(),groupId=document.getElementById('tgJoinedGroup').value;
   if(joinedGroupAccount!==id||!joinedGroupChoices.some(g=>g.group_id===groupId))throw Error('Load joined groups for the selected account first.');
-  document.getElementById('tgGroupsStatus').textContent='Reading visible admins…';
-  try{const result=await api('/groups/admins',{account_id:id,group_id:groupId});await refresh(false);document.getElementById('tgGroupsStatus').textContent=result.count+' visible admins saved for '+result.group+'.';toast('Admin records saved. No messages were sent.');
+  if(!serverFeatures.new_group_picker_archive)throw Error('Deploy gateway v3.15 on Render to collect and archive new groups.');
+  document.getElementById('tgGroupsStatus').textContent='Saving visible admins, then archiving this group…';
+  try{const result=await api('/groups/new/admins',{account_id:id,group_id:groupId,watch_principal:joinedGroupPrincipal});await refresh(false);resetJoinedGroupPicker();document.getElementById('tgGroupsStatus').textContent=result.count+' visible admins saved for '+result.group+'. '+groupArchiveLabel(result.archive);toast('Admin data saved. '+groupArchiveLabel(result.archive));
   }catch(error){document.getElementById('tgGroupsStatus').textContent=error.message;try{await refresh(false)}catch{}throw error}
  });
  document.getElementById('refreshGroupAdminData').onclick=()=>action(document.getElementById('refreshGroupAdminData'),()=>refresh(false));
  renderAccountSelectors();renderGroupAdmins();
 });
+async function loadNewJoinedGroups(){
+ const id=groupReadReady();resetJoinedGroupPicker();
+ if(!serverFeatures.new_group_picker_archive)throw Error('Deploy gateway v3.15 on Render to use Add new group data.');
+ document.getElementById('tgGroupsStatus').textContent='Checking new joined groups for Account '+id+'…';
+ try{const result=await api('/groups/new',{account_id:id});joinedGroupChoices=result.groups;joinedGroupAccount=id;joinedGroupPrincipal=result.watch_principal;
+  const node=document.getElementById('tgJoinedGroup');node.innerHTML='<option value="">Choose a new joined group…</option>'+joinedGroupChoices.map(g=>`<option value="${esc(g.group_id)}">${esc(g.name)}${g.username?' · @'+esc(g.username):''}${g.status==='Unavailable'?' · previous read unavailable':''}</option>`).join('');node.disabled=!joinedGroupChoices.length;
+  document.getElementById('tgGroupsStatus').textContent=joinedGroupChoices.length?joinedGroupChoices.length+' new joined groups available. Choose one, then Get admins & archive.':'No new unsaved groups found. Earlier groups are excluded; already collected groups appear below.';
+ }catch(error){document.getElementById('tgGroupsStatus').textContent=error.message;throw error}
+}
+function groupArchiveLabel(archive){return !archive?'':archive.status==='Archived'?'Archived in Telegram.':archive.status==='Pending'?'Archive pending · admin data is saved.':archive.error||'Archive: '+archive.status}
