@@ -51,7 +51,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     $('#workspaceResetStatus').textContent='Waiting for active operations, then clearing workspace records…';
     await api('/workspace/reset',{confirmation:'RESET DATA',request_id:workspaceResetRequestId});
     people=[];leads=[];deliveries=[];quotaResets=[];logs=[];queuedSends=[];inboxReplyDrafts.clear();inboxReplyRequests.clear();selected.clear();activeInboxKey=null;savedMessageContact=null;followupDelivery=null;$('#autoSend').checked=false;
-    for(const dialog of $$('dialog[open]'))dialog.close();await refresh(false);renderReplyInbox();view('replies');toast('Workspace data reset. Telegram accounts and message templates were kept.');
+    for(const dialog of $$('dialog[open]'))dialog.close();await refresh(false);renderReplyInbox();view('saved');toast('Workspace data reset. Telegram accounts and message templates were kept.');
   });
   renderReplyInbox();
 });

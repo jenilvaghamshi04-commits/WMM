@@ -984,7 +984,7 @@ async def joined_groups(body:Account):
             joined_group_cache[principal]=data
             return {**data,'account_id':body.account_id,'cached':False}
         except (errors.FloodWaitError,errors.PeerFloodError) as exc:
-            pause_for_telegram(principal,exc);raise HTTPException(429,'Telegram paused group reading. Check Account health and wait before trying again.')
+            pause_for_telegram(principal,exc);raise HTTPException(429,'Telegram paused group reading. Wait for the account pause to end before trying again.')
         except errors.RPCError as exc:raise HTTPException(400,str(exc))
 
 @app.get('/groups/admins',dependencies=[Depends(auth)])
@@ -1301,7 +1301,7 @@ async def scan(body:Scan):
                     if is_group:save(group)
             return {'contacts':result,'group':entity.title,'count':len(result),'group_record':snapshot,'leave':leave,'account_id':body.account_id}
         except (errors.FloodWaitError,errors.PeerFloodError) as exc:
-            pause_for_telegram(principal,exc);raise HTTPException(429,'Telegram paused admin reading. Check Account health and wait before trying again.')
+            pause_for_telegram(principal,exc);raise HTTPException(429,'Telegram paused admin reading. Wait for the account pause to end before trying again.')
         except errors.UserNotParticipantError:raise HTTPException(409,'This account is not a member. Join in Telegram before loading admins.')
         except errors.InviteRequestSentError:raise HTTPException(409,'Join request sent. Scan after an administrator approves it.')
         except errors.ChatAdminRequiredError:raise HTTPException(403,'Telegram hides this admin list from your account. Try its linked discussion group or ask for access.')
