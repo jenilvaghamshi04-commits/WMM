@@ -292,3 +292,10 @@ An always-visible Message delay selector on the same page edits the existing glo
 The editable Message delay card is at the top of TG Groups admins. Each group keeps its own collapsible name/account heading. Selecting admins opens an inline composer on this same page, with token, exchange and saved message option fields. Custom text entry is omitted from this composer. Choose Random saved options for a shuffled cycle, or a specific available option; for multiple recipients that chosen option goes first and the remaining recipients continue the nonrepeating cycle. Used options are unavailable until their current cycle finishes. Token and exchange are required for this flow. Review exact personalized previews before sending; pending send status and cancellation stay on the page.
 
 Dashboard timestamps, queued-send times, QR expiry, account waits, logs and history explicitly use Asia/Kolkata and display IST, regardless of the browser's timezone. Country-based follow-up schedule calculations retain the recipient's timezone; their displayed due dates are converted to IST. Stored UTC timestamps, original-sender rules, account pauses, daily limits, delayed queues and existing data are unchanged. This update uses the existing backend endpoints.
+
+
+## Interactive TG Groups admins demo
+
+Open /demo.html without a Telegram or gateway login. Fictional groups, CEO/CTO/moderator/BD rows, two ready senders (a third can be added), account selection, group search/dropdowns, simulated collection/archive, message-template editing, saved-option rotation, token/exchange previews, saved delays, queue cancellation and sent statuses run in the browser. Advance 10 minutes tests pending delays instantly; Reset demo restores only fictional demo records. Refresh retains the browser's demo state.
+
+The demo uses the isolated localStorage key wmm.groups.demo.v1, substitutes an allowlisted local API, never reads the live dashboard session, and has a connect-src none CSP. It never sends Telegram messages or changes server records. The compatibility /groups-demo.html entry redirects to /demo.html.
