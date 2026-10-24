@@ -113,6 +113,15 @@ async def dashboard_login(body:DashboardLogin,request:Request):
     db.execute('insert into dashboard_sessions values(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),DASHBOARD_USERNAME,expiry));db.commit()
     return {'access_token':token,'username':DASHBOARD_USERNAME,'expires_at':expiry}
 
+@app.post('/auth/session',dependencies=[Depends(auth)])
+async def resume_dashboard_session(authorization:str=Header(default='')):
+    # Exchange the long-lived gateway key; only an expiring issued token is cached.
+    token=authorization.removeprefix('Bearer ')
+    if secrets.compare_digest(token.encode(),KEY.encode()):token=secrets.token_urlsafe(32)
+    expiry=(datetime.now(timezone.utc)+timedelta(hours=12)).isoformat()
+    db.execute('insert or replace into dashboard_sessions values(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),DASHBOARD_USERNAME,expiry));db.commit()
+    return {'access_token':token,'username':DASHBOARD_USERNAME,'expires_at':expiry}
+
 @app.post('/auth/logout',dependencies=[Depends(auth)])
 async def dashboard_logout(authorization:str=Header(default='')):
     db.execute('delete from dashboard_sessions where token_hash=?',(hashlib.sha256(authorization.removeprefix('Bearer ').encode()).hexdigest(),));db.commit()
@@ -895,6 +904,7 @@ async def rpc_error(request,exc):
     return JSONResponse(status_code=400,content={'detail':str(exc)})
 class Account(BaseModel):account_id:int=Field(default=1,ge=1,le=3)
 class Login(Account):phone:str
+class ResendLogin(Account):phone:str=''
 class Verify(Account):phone:str='';code:str='';password:str=''
 class Scan(Account):link:str;join:bool=False;leave_after_scan:bool=False;joined_only:bool=False
 class GroupAdminRead(Account):group_id:str=Field(min_length=1,max_length=40)
@@ -926,7 +936,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/api/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.16','time':int(datetime.now(timezone.utc).timestamp()*1000)},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.17','time':int(datetime.now(timezone.utc).timestamp()*1000)},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -1189,7 +1199,7 @@ async def status():
         u=usage(principal)
         sent=sent_in_current_quota(principal)
         accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'daily_progress':daily_progress(principal),'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'group_watch':group_watch_status(principal,authorized),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
-    return {'version':'3.16','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'account_slots':account_slot_count(),'group_admins':group_admin_records(),'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True,'group_admin_directory':True,'progressive_accounts':True,'admin_bulk_sends':True,'new_group_watch':True,'new_group_picker_archive':True}}
+    return {'version':'3.17','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'account_slots':account_slot_count(),'group_admins':group_admin_records(),'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'login_code_recovery':True,'persistent_workspace_session':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True,'group_admin_directory':True,'progressive_accounts':True,'admin_bulk_sends':True,'new_group_watch':True,'new_group_picker_archive':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
 WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue','manual_send_queue','template_rotation','tg_group_admins','tg_admin_batches','tg_group_watch_jobs','tg_group_archives')
 def workspace_reset_counts():
@@ -1244,7 +1254,61 @@ def login_progress(slot):
     state=login_pending.get(slot)
     if state and state['expires_at']<=stamp():login_pending.pop(slot,None);state=None
     qr=qr_logins.get(slot)
-    return {'login_step':('password' if state['password_required'] else 'code') if state else ('qr' if qr and qr['status']=='waiting' else 'phone'),'login_phone_hint':('••••'+state['phone'][-4:]) if state and state.get('phone') else ''}
+    return {'login_step':('password' if state['password_required'] else 'code') if state else ('qr' if qr and qr['status']=='waiting' else 'phone'),'login_phone_hint':('••••'+state['phone'][-4:]) if state and state.get('phone') else '',**code_delivery_status(state)}
+def code_delivery_name(value):
+    name=type(value).__name__
+    if name.endswith('App'):return 'Telegram app'
+    if name.endswith('FragmentSms'):return 'Fragment'
+    if name.endswith('Sms'):return 'SMS'
+    if name.endswith('MissedCall'):return 'missed call'
+    if name.endswith('Call'):return 'phone call'
+    if name.endswith('EmailCode'):return 'email'
+    return 'Telegram-selected method'
+def code_delivery_status(state):
+    if not state or state.get('password_required') or state.get('method')=='qr':return {}
+    return {key:state.get(key) for key in ('code_delivery','code_next_delivery','code_resend_at','code_resend_available')}
+def store_login_code(slot,phone,result):
+    now=datetime.now(timezone.utc)
+    login_pending[slot]={'phone':phone,'hash':result.phone_code_hash,'password_required':False,'expires_at':(now+timedelta(minutes=10)).isoformat(),
+      'code_delivery':code_delivery_name(getattr(result,'type',None)),
+      'code_next_delivery':code_delivery_name(result.next_type) if getattr(result,'next_type',None) else '',
+      'code_resend_at':(now+timedelta(seconds=max(60,getattr(result,'timeout',None) or 60))).isoformat(),
+      'code_resend_available':bool(getattr(result,'next_type',None))}
+def enforce_login_wait(phone):
+    wait_key='login_code_wait:'+hashlib.sha256(phone.encode()).hexdigest()
+    wait=db.execute('select value from meta where key=?',(wait_key,)).fetchone()
+    if wait and wait[0]>stamp():
+        seconds=max(1,math.ceil((datetime.fromisoformat(wait[0])-datetime.now(timezone.utc)).total_seconds()))
+        raise HTTPException(429,'Login code requests are paused. Try again after '+str(seconds)+' seconds. Use an already delivered code or QR login.',headers={'Retry-After':str(seconds)})
+    return wait_key
+
+@app.post('/login/resend',dependencies=[Depends(auth)])
+async def resend_login_code(body:ResendLogin):
+    async with lock:
+        client=require_client(body.account_id)
+        if not client.is_connected():await client.connect()
+        if await client.is_user_authorized():return {'authorized':True,'account_id':body.account_id}
+        login_progress(body.account_id);state=login_pending.get(body.account_id)
+        if not state or state.get('method')=='qr':raise HTTPException(409,'Request a phone login code first, or use QR login.')
+        if state['password_required']:raise HTTPException(409,'Your code was accepted. Enter your two-step password.')
+        if body.phone and normalize_login_phone(body.phone)!=state['phone']:raise HTTPException(409,'This code belongs to another phone number.')
+        wait_key=enforce_login_wait(state['phone'])
+        if not state.get('code_resend_available'):raise HTTPException(409,'Telegram has not offered another code delivery method. Use Connect with QR code on a signed-in phone, or wait for this login to expire.')
+        seconds=math.ceil((datetime.fromisoformat(state['code_resend_at'])-datetime.now(timezone.utc)).total_seconds())
+        if seconds>0:raise HTTPException(429,'Wait '+str(seconds)+' seconds before requesting the next delivery method.',headers={'Retry-After':str(seconds)})
+        # Reserve a gap before the network call, including ambiguous network failures.
+        state['code_resend_at']=(datetime.now(timezone.utc)+timedelta(seconds=60)).isoformat()
+        try:result=await client(functions.auth.ResendCodeRequest(phone_number=state['phone'],phone_code_hash=state['hash']))
+        except (errors.SendCodeUnavailableError,errors.FloodWaitError) as error:
+            seconds=max(1,error.seconds) if isinstance(error,errors.FloodWaitError) else 900
+            db.execute('insert or replace into meta values(?,?)',(wait_key,(datetime.now(timezone.utc)+timedelta(seconds=seconds)).isoformat()));db.commit()
+            raise HTTPException(429,'Telegram cannot resend a code now. Wait '+str(seconds)+' seconds, or use QR login.',headers={'Retry-After':str(seconds)})
+        except (errors.PhoneCodeExpiredError,errors.PhoneCodeHashEmptyError):
+            login_pending.pop(body.account_id,None);raise HTTPException(409,'This code expired. Request a new login code.')
+        if not getattr(result,'phone_code_hash',None):raise HTTPException(409,'Telegram did not return a new code. Use QR login.')
+        store_login_code(body.account_id,state['phone'],result)
+        return {'ok':True,'account_id':body.account_id,'login_step':'code',**code_delivery_status(login_pending[body.account_id])}
+
 async def renew_login_client(slot,old):
     # Reset only a rejected Telegram transport key for this slot; retain app records and API settings.
     await old.disconnect()
@@ -1333,13 +1397,9 @@ async def login(body:Login):
         if qr_logins.get(body.account_id,{}).get('status')=='waiting':raise HTTPException(409,'Scan the pending QR code or cancel QR login before requesting a phone code.')
         pending=login_pending.get(body.account_id)
         if pending and pending['phone']==phone:
-            return {'ok':True,'account_id':body.account_id,'login_step':'password' if pending['password_required'] else 'code','existing_code':True}
+            return {'ok':True,'account_id':body.account_id,'login_step':'password' if pending['password_required'] else 'code','existing_code':True,**code_delivery_status(pending)}
         if pending:raise HTTPException(409,'Finish the pending login for this account, or wait for it to expire before using another phone number.')
-        wait_key='login_code_wait:'+hashlib.sha256(phone.encode()).hexdigest()
-        wait=db.execute('select value from meta where key=?',(wait_key,)).fetchone()
-        if wait and wait[0]>stamp():
-            seconds=max(1,math.ceil((datetime.fromisoformat(wait[0])-datetime.now(timezone.utc)).total_seconds()))
-            raise HTTPException(429,'Login code requests are paused. Try again after '+str(seconds)+' seconds. Check Telegram’s service chat for a code already delivered.',headers={'Retry-After':str(seconds)})
+        wait_key=enforce_login_wait(phone)
         def clear_stale_code(client):
             # Telethon interprets a cached hash as an implicit resend. There is no live
             # pending login here, so start a fresh sendCode rather than exhausting media.
@@ -1361,8 +1421,8 @@ async def login(body:Login):
         except LOGIN_AUTH_ERRORS:raise HTTPException(409,'Telegram could not start this login. Request a new code for this account again.')
         except errors.PhoneNumberInvalidError:raise HTTPException(400,'Telegram rejected this phone number. Check the +country code and number.')
         if not getattr(r,'phone_code_hash',None):raise HTTPException(409,'Telegram did not start a code login. Request a new login code.')
-        login_pending[body.account_id]={'phone':phone,'hash':r.phone_code_hash,'password_required':False,'expires_at':(datetime.now(timezone.utc)+timedelta(minutes=10)).isoformat()}
-    return {'ok':True,'account_id':body.account_id,'login_step':'code'}
+        store_login_code(body.account_id,phone,r)
+    return {'ok':True,'account_id':body.account_id,'login_step':'code',**code_delivery_status(login_pending[body.account_id])}
 @app.post('/verify',dependencies=[Depends(auth)])
 async def verify(body:Verify):
     async with lock:

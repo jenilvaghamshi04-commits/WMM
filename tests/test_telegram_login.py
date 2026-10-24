@@ -107,3 +107,54 @@ class TelegramLoginTests(unittest.TestCase):
         self.request()
         with self.assertRaises(HTTPException):self.request(phone='+441234567890')
         self.assertEqual(self.client.codes_requested,1);self.assertEqual(self.app.login_pending[1]['phone'],'+919876543210')
+
+    def prepare_resend(self):
+        from telethon import types
+        result=SimpleNamespace(phone_code_hash='old-hash',type=types.auth.SentCodeTypeApp(length=5),next_type=types.auth.CodeTypeSms(),timeout=120)
+        self.app.store_login_code(1,'+919876543210',result)
+        return self.app.login_pending[1]
+    def test_delivery_metadata_and_explicit_resend_use_new_hash(self):
+        from telethon import types
+        from unittest.mock import AsyncMock
+        state=self.prepare_resend();self.assertEqual(self.app.login_progress(1)['code_delivery'],'Telegram app')
+        state['code_resend_at']=(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat()
+        rpc=AsyncMock(return_value=SimpleNamespace(phone_code_hash='new-hash',type=types.auth.SentCodeTypeSms(length=5),next_type=None,timeout=60))
+        with patch.object(LoginClient,'__call__',rpc,create=True):
+            result=self.run_async(self.app.resend_login_code(self.app.ResendLogin(account_id=1)))
+        self.assertEqual(result['code_delivery'],'SMS');self.assertFalse(result['code_resend_available']);self.assertEqual(self.app.login_pending[1]['hash'],'new-hash');self.assertEqual(rpc.call_args.args[0].phone_code_hash,'old-hash');self.assertEqual(self.client.codes_requested,0)
+    def test_resend_cannot_skip_timer_phone_or_password_step(self):
+        state=self.prepare_resend()
+        for body in [self.app.ResendLogin(account_id=1),self.app.ResendLogin(account_id=1,phone='+441234567890')]:
+            with self.assertRaises(HTTPException):self.run_async(self.app.resend_login_code(body))
+        state['password_required']=True
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.resend_login_code(self.app.ResendLogin()))
+        self.assertIn('accepted',e.exception.detail);self.assertEqual(self.client.codes_requested,0)
+    def test_no_next_delivery_never_implicitly_resends(self):
+        self.request()
+        with self.assertRaises(HTTPException) as e:self.run_async(self.app.resend_login_code(self.app.ResendLogin()))
+        self.assertIn('QR',e.exception.detail);self.assertEqual(self.client.codes_requested,1)
+    def test_resend_flood_pause_survives_reload_and_other_slot(self):
+        from unittest.mock import AsyncMock
+        state=self.prepare_resend();state['code_resend_at']=(datetime.now(timezone.utc)-timedelta(seconds=1)).isoformat()
+        rpc=AsyncMock(side_effect=errors.FloodWaitError(request=None,capture=120))
+        with patch.object(LoginClient,'__call__',rpc,create=True):
+            with self.assertRaises(HTTPException) as e:self.run_async(self.app.resend_login_code(self.app.ResendLogin()))
+        self.assertEqual(e.exception.headers['Retry-After'],'120')
+        self.app.db.close();self.load();self.app.clients[2]=LoginClient(user=102)
+        with self.assertRaises(HTTPException):self.request(slot=2)
+        self.assertEqual(self.app.clients[2].codes_requested,0)
+    def test_workspace_key_exchange_and_session_survive_server_reload(self):
+        result=self.run_async(self.app.resume_dashboard_session('Bearer test-secret'));token=result['access_token']
+        self.assertNotEqual(token,'test-secret');self.assertEqual(self.app.auth('Bearer '+token),'admin')
+        self.app.db.close();self.load();self.assertEqual(self.app.auth('Bearer '+token),'admin')
+        renewed=self.run_async(self.app.resume_dashboard_session('Bearer '+token));self.assertEqual(renewed['access_token'],token)
+        self.run_async(self.app.dashboard_logout('Bearer '+token))
+        with self.assertRaises(HTTPException):self.app.auth('Bearer '+token)
+    def test_session_endpoint_rejects_missing_expired_or_revoked_tokens(self):
+        from fastapi.testclient import TestClient
+        client=TestClient(self.app.app)
+        self.assertEqual(client.post('/auth/session').status_code,401)
+        self.assertEqual(client.post('/auth/session',headers={'Authorization':'Bearer invalid'}).status_code,401)
+        result=self.run_async(self.app.resume_dashboard_session('Bearer test-secret'));token=result['access_token']
+        self.app.db.execute("update dashboard_sessions set expires_at='2000-01-01T00:00:00+00:00'");self.app.db.commit()
+        self.assertEqual(client.post('/auth/session',headers={'Authorization':'Bearer '+token}).status_code,401)
