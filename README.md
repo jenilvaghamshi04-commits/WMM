@@ -315,3 +315,8 @@ Connections now shows the actual Telegram code delivery method, the next deliver
 Dashboard sessions use expiring issued tokens in localStorage with sessionStorage fallback; existing same-tab sessions migrate on successful restore. Gateway-key connections now exchange the key for an issued token through authenticated POST /auth/session, so the raw gateway key is never saved in browser storage. Passwords, Telegram API hashes and login codes are not cached. Valid restoration keeps the login form hidden while loading the saved page. Server wake-up/network errors retain the session and offer Retry; expired/revoked tokens still require login. Demo storage remains fully isolated.
 
 Deploy v3.17 on Render to activate code recovery and key exchange. A browser refresh never clears workspace tables. Container replacement can still lose records if DATA_DIR points to temporary storage: configure an existing durable private disk path before expecting data or Telegram sessions to survive redeployment. No paid plan or disk has been created by this change.
+
+
+### WMM workspace design refresh
+
+The dashboard and isolated demo use workspace-polish.css for a deep green navigation rail, warm light surfaces, readable dark mode, compact account quota cards, clearer community tables, improved template editor tabs and a split login layout. Collection instructions are available in an expandable explanation; the monitoring status and group tools remain visible. All existing control IDs and application scripts are retained. Pending sends remains on Saved data only. This update changes presentation without resetting data, credentials, message templates, queues or sender rules.
