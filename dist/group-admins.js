@@ -42,7 +42,7 @@ function renderGroupWatch(){
  return `<div class="tg-watch-account"><b>Account ${a.id} · ${esc(a.label)}</b><span class="hint">${esc(state)}</span>${w.ready?`<small class="hint">Started ${esc(new Date(w.started_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:true,timeZoneName:'short'}))} · ${Number(w.saved)||0} collected · ${Number(w.pending)||0} pending${w.unavailable?' · '+Number(w.unavailable)+' unavailable':''}</small>`:''}</div>`}).join('');
 }
 function renderGroupAdmins(){
- const root=document.getElementById('tgGroupRecords');if(!root)return;renderAdminBatchBar();renderGroupWatch();
+ const root=document.getElementById('tgGroupRecords');if(!root)return;renderAdminBatchBar();renderGroupWatch();renderDailyProgress();
  const expanded=root.querySelector?.('details[data-group-key][open]');
  if(expanded)groupAdminOpenKey=expanded.dataset.groupKey;else if(root.querySelector?.('details[data-group-key]'))groupAdminOpenKey=null;
  renderGroupDelay();
@@ -103,4 +103,16 @@ function renderGroupDelay(){
  if(!groupPageDelayDirty)select.value=String(groupPageDelay);
  document.getElementById('tgSaveDelay').disabled=!live||!serverFeatures.send_pacing;
  document.getElementById('tgPageDelayHint').textContent='Current minimum: '+groupPageDelay/60+' minutes per account. A longer delay selected for a queued batch stays in place.';
+}
+
+function renderDailyProgress(){
+ const root=document.getElementById('tgDailyProgress');if(!root)return;
+ root.innerHTML=visibleAccounts().map(a=>{
+  const ready=a.daily_progress,paused=a.blocked_until&&new Date(a.blocked_until)>new Date();
+  const rows=['dm','group'].map(kind=>{const q=ready?.[kind]||{...(a.usage?.[kind]||{}),sent:null,queued:queuedSends.filter(j=>j.account_id===a.id&&j.kind===kind&&j.status==='Queued').length};
+   const limit=Number(q.limit)||(kind==='dm'?15:30),used=Number(q.used)||0,queued=Number(q.queued)||0,remaining=Math.max(0,Number(q.remaining)||0),pct=Math.min(100,used/limit*100),reserve=Math.min(100-pct,queued/limit*100);
+   return `<div class="tg-progress-row"><div class="tg-progress-label"><b>${kind==='dm'?'New DM contacts':'Group messages'}</b><span>${limit} daily limit</span></div><div class="tg-progress-track" role="progressbar" aria-label="Account ${a.id} ${kind==='dm'?'new DM contacts':'group messages'} allowance used or reserved" aria-valuemin="0" aria-valuemax="${limit}" aria-valuenow="${Math.min(limit,used+(ready?queued:0))}"><span class="tg-progress-used" style="width:${pct}%"></span>${ready?`<span class="tg-progress-queued" style="width:${reserve}%"></span>`:''}</div><dl class="tg-progress-counts"><div><dt>${ready?'Sent':'Slots used'}</dt><dd>${ready?Number(q.sent)||0:used}</dd></div><div><dt>Queued</dt><dd>${queued}</dd></div><div><dt>Remaining</dt><dd>${remaining}</dd></div></dl>${q.other_used?`<small class="hint">${Number(q.other_used)} additional attempts use allowance; check delivery status.</small>`:''}${kind==='dm'&&q.queued_messages>queued?`<small class="hint">${q.queued_messages-queued} queued repeat DMs use no new-contact slots.</small>`:''}</div>`;
+  }).join('');
+  return `<article class="card tg-progress-card"><div class="tg-progress-heading"><b>Account ${a.id} · ${esc(a.label)}</b><span class="pill">${!a.authorized?'Not connected':paused?'Paused':'Connected'}</span></div>${rows}<p class="hint tg-progress-foot">${ready?'Remaining excludes queued allowance. Resets at midnight IST.':'Deploy gateway v3.16 for confirmed sent totals and queued reservations.'}</p></article>`;
+ }).join('');
 }

@@ -299,3 +299,10 @@ Dashboard timestamps, queued-send times, QR expiry, account waits, logs and hist
 Open /demo.html without a Telegram or gateway login. Fictional groups, CEO/CTO/moderator/BD rows, two ready senders (a third can be added), account selection, group search/dropdowns, simulated collection/archive, message-template editing, saved-option rotation, token/exchange previews, saved delays, queue cancellation and sent statuses run in the browser. Advance 10 minutes tests pending delays instantly; Reset demo restores only fictional demo records. Refresh retains the browser's demo state.
 
 The demo uses the isolated localStorage key wmm.groups.demo.v1, substitutes an allowlisted local API, never reads the live dashboard session, and has a connect-src none CSP. It never sends Telegram messages or changes server records. The compatibility /groups-demo.html entry redirects to /demo.html.
+
+
+## Daily account progress (v3.16)
+
+TG Groups admins and the isolated demo show an account card at the top with separate daily bars for new DM contacts (15) and group messages (30). Each shows Sent, Queued and Remaining. The status endpoint supplies daily_progress per Telegram identity using the same IST quota day and reset floors as send enforcement. Remaining subtracts pending new-recipient reservations for DMs and pending attempts for groups. Repeat DMs reserve no extra new-contact slot; cancelled queues are excluded. Failed/uncertain/in-flight attempts that already use allowance appear in an additional-use note instead of being labelled Sent. The bar measures allowance used or reserved. Counts are scoped to identity even if account slots change.
+
+Older gateways display their existing Slots used metric until gateway v3.16 is deployed; they never label it as confirmed Sent. The demo updates its bars after simulated sends, cancellations, clock advances and resets. No live quota or data reset occurs in this update.

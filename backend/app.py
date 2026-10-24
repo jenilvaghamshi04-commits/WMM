@@ -17,7 +17,7 @@ ROOT=Path(os.getenv('DATA_DIR','./data'));ROOT.mkdir(parents=True,exist_ok=True)
 KEY=os.environ['DASHBOARD_KEY']
 API_ID=os.getenv('TELEGRAM_API_ID');API_HASH=os.getenv('TELEGRAM_API_HASH')
 TZ=ZoneInfo('Asia/Kolkata');LIMITS={'dm':15,'group':30};DAILY_GOAL=10
-app=FastAPI(title='WMM Team',version='3.15')
+app=FastAPI(title='WMM Team',version='3.16')
 app.add_middleware(CORSMiddleware,allow_origins=[os.getenv('SITE_ORIGIN','https://teamradar-telegram-desk.jenilvaghamshi04.chatgpt.site')],allow_methods=['GET','POST'],allow_headers=['Authorization','Content-Type'])
 lock=asyncio.Lock();login_pending={};qr_logins={};clients={};startup_errors={};reply_task=None;geo_task=None;geo_lock=asyncio.Lock();folder_task=None;auto_yes_task=None;auto_yes_lock=asyncio.Lock();auto_followup_task=None;auto_followup_lock=asyncio.Lock();manual_queue_task=None;manual_queue_lock=asyncio.Lock()
 db=sqlite3.connect(ROOT/'desk.db',check_same_thread=False)
@@ -360,6 +360,16 @@ def usage(principal):
 def sent_in_current_quota(principal):
     date=today()
     return new_dm_count(principal,date,quota_floor(principal,'dm',date),True)+db.execute("select count(*) from outbox where principal=? and kind='group' and day=? and rowid>? and status='Sent'",(principal,date,quota_floor(principal,'group',date))).fetchone()[0]
+
+def daily_progress(principal):
+    date=today();quotas=usage(principal);result={}
+    for kind in LIMITS:
+        pending=[r[0] for r in db.execute("select target from manual_send_queue where principal=? and kind=? and status='Queued'",(principal,kind))]
+        queued=len({target for target in pending if dm_needs_new_slot(principal,target,date)}) if kind=='dm' else len(pending)
+        floor=quota_floor(principal,kind,date)
+        sent=new_dm_count(principal,date,floor,True) if kind=='dm' else db.execute("select count(*) from outbox where principal=? and kind='group' and day=? and rowid>? and status='Sent'",(principal,date,floor)).fetchone()[0]
+        result[kind]={**quotas[kind],'sent':sent,'queued':queued,'queued_messages':len(pending),'other_used':max(0,quotas[kind]['used']-sent),'remaining':max(0,quotas[kind]['remaining']-queued)}
+    return {'date':date,'timezone':'Asia/Kolkata',**result}
 
 def reset_records():
     keys=['reset_id','principal','account_id','kind','day','after_rowid','at','before_used','request_id']
@@ -916,7 +926,7 @@ class TelegramAPI(Account):api_id:int=Field(gt=0);api_hash:SecretStr
 @app.get('/api/health')
 async def health():
     from fastapi.responses import JSONResponse
-    return JSONResponse({'service':'teamradar','ok':True,'version':'3.15','time':int(datetime.now(timezone.utc).timestamp()*1000)},headers={'Cache-Control':'no-store, max-age=0'})
+    return JSONResponse({'service':'teamradar','ok':True,'version':'3.16','time':int(datetime.now(timezone.utc).timestamp()*1000)},headers={'Cache-Control':'no-store, max-age=0'})
 @app.post('/telegram-api',dependencies=[Depends(auth)])
 async def configure_telegram_api(body:TelegramAPI):
     slot=body.account_id;value=body.api_hash.get_secret_value().strip()
@@ -1178,8 +1188,8 @@ async def status():
             if row:principal,label,phone,blocked=row
         u=usage(principal)
         sent=sent_in_current_quota(principal)
-        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'group_watch':group_watch_status(principal,authorized),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
-    return {'version':'3.15','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'account_slots':account_slot_count(),'group_admins':group_admin_records(),'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True,'group_admin_directory':True,'progressive_accounts':True,'admin_bulk_sends':True,'new_group_watch':True,'new_group_picker_archive':True}}
+        accounts.append({'id':slot,'label':label,'phone':phone,'api_configured':c is not None,'authorized':authorized,'usage':u,'daily_goal':DAILY_GOAL,'daily_progress':daily_progress(principal),'sent_today':sent,'blocked_until':blocked,'error':startup_errors.get(slot,''),'group_watch':group_watch_status(principal,authorized),'health':account_health(principal,c,authorized,blocked,startup_errors.get(slot,'')),'pacing':pacing_status(principal),**login_progress(slot)})
+    return {'version':'3.16','api_configured':accounts[0]['api_configured'],'authorized':any(a['authorized'] for a in accounts),'accounts':accounts,'account_slots':account_slot_count(),'group_admins':group_admin_records(),'quota_date':today(),'quota_timezone':'Asia/Kolkata','contacts':contacts(),'settings':{**settings(),'template_rotation':rotation_status(settings())},'queued_sends':queued_send_records(),'deliveries':records(),'quota_resets':reset_records(),'leads':lead_records(),'features':{'token_personalization':True,'new_recipient_dm_quota':True,'message_templates':True,'lead_management':True,'telegram_folder_routing':True,'code_first_login':True,'qr_login':True,'automatic_yes_sequence':True,'automatic_followups':True,'original_sender_lock':True,'workspace_reset':True,'reply_inbox':True,'send_pacing':True,'background_sends':True,'manual_replies':True,'nonrepeating_templates':True,'contact_import':True,'template_variants':True,'country_timezones':True,'affirmative_only':True,'group_admin_directory':True,'progressive_accounts':True,'admin_bulk_sends':True,'new_group_watch':True,'new_group_picker_archive':True}}
 # Workspace reset never disconnects Telegram or changes message templates.
 WORKSPACE_DATA_TABLES=('contacts','deliveries','outbox','message_details','followup_requests','quota_resets','lead_settings','replies','reply_sync','folder_routes','empty_folder_templates','auto_yes_jobs','auto_yes_enrollments','auto_followup_jobs','import_batches','location_profiles','country_lookup_queue','manual_send_queue','template_rotation','tg_group_admins','tg_admin_batches','tg_group_watch_jobs','tg_group_archives')
 def workspace_reset_counts():
